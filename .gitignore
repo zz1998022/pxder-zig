@@ -1,0 +1,21 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config with tokens (sensitive)
+.config/
+
+# Temp files
+*.tmp
+*.bak

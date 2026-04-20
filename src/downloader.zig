@@ -1,0 +1,571 @@
+//! 多线程下载引擎模块
+//! 使用工作窃取模式实现并发下载，包含重试、完整性校验、全局暂停等逻辑。
+//!
+//! 下载流程:
+//!   1. 清理临时目录
+//!   2. 创建 N 个工作线程（默认 5，范围 1-32）
+//!   3. 每个线程从共享原子索引中取任务执行（工作窃取模式）
+//!   4. 文件先下载到内存，写入临时目录，校验大小后移动到最终路径
+//!
+//! 重试策略:
+//!   - 单文件最多重试 10 次
+//!   - 超过 1 个线程同时出错时触发 5 分钟全局暂停
+//!   - 404 立即跳过不重试
+//!
+//! 画师目录命名:
+//!   格式为 "(uid)clean_name"，画师改名时可根据 auto_rename 配置自动重命名
+
+const std = @import("std");
+const http_client = @import("http_client.zig");
+const config = @import("config.zig");
+const illust = @import("illust.zig");
+const illustrator = @import("illustrator.zig");
+const pixiv_api = @import("pixiv_api.zig");
+const terminal = @import("terminal.zig");
+
+/// 最大重试次数
+const MAX_RETRY: u32 = 10;
+
+/// 全局暂停时长（纳秒）：5 分钟
+const PAUSE_DURATION: u64 = 5 * 60 * std.time.ns_per_s;
+
+/// 重试间隔（纳秒）：1 秒
+const RETRY_INTERVAL: u64 = std.time.ns_per_s;
+
+/// 下载请求 Referer 头
+const REFERER = "https://www.pixiv.net/";
+
+/// 下载任务共享状态（线程安全）
+pub const DownloadState = struct {
+    mutex: std.atomic.Mutex = .unlocked, // 保护共享数据的互斥锁
+    next_index: std.atomic.Value(usize), // 下一个待下载任务的索引（工作窃取模式）
+    total_count: usize, // 总任务数
+    error_count: std.atomic.Value(u32), // 当前出错线程数（原子操作）
+    is_paused: std.atomic.Value(bool), // 全局暂停标志（多个线程出错时触发）
+    success_count: std.atomic.Value(u32), // 成功下载数
+    skip_count: std.atomic.Value(u32), // 跳过数（404 等）
+
+    /// 初始化下载状态
+    pub fn init(total: usize) DownloadState {
+        return .{
+            .next_index = std.atomic.Value(usize).init(0),
+            .total_count = total,
+            .error_count = std.atomic.Value(u32).init(0),
+            .is_paused = std.atomic.Value(bool).init(false),
+            .success_count = std.atomic.Value(u32).init(0),
+            .skip_count = std.atomic.Value(u32).init(0),
+        };
+    }
+};
+
+/// 工作线程上下文，传递给每个工作线程
+const WorkerContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    http: *http_client.HttpClient,
+    state: *DownloadState,
+    illusts: []const illust.Illust,
+    temp_dir: []const u8,
+    final_dir: []const u8,
+};
+
+/// 下载管理器
+pub const Downloader = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    config: config.DownloadConfig,
+    http: *http_client.HttpClient,
+
+    /// 初始化下载管理器
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.DownloadConfig, http: *http_client.HttpClient) Downloader {
+        return .{
+            .allocator = allocator,
+            .io = io,
+            .config = cfg,
+            .http = http,
+        };
+    }
+
+    /// 多线程下载插画列表
+    /// illusts: 待下载的插画数组
+    /// dir: 最终存放目录
+    pub fn downloadIllusts(self: *Downloader, illusts_list: []const illust.Illust, dir: []const u8) !void {
+        if (illusts_list.len == 0) return;
+
+        // 确保最终目录存在
+        std.Io.Dir.cwd().createDirPath(self.io, dir) catch {};
+
+        // 确定临时目录路径
+        const temp_dir = if (self.config.tmp) |tmp|
+            try std.fmt.allocPrint(self.allocator, "{s}", .{tmp})
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{dir});
+        defer self.allocator.free(temp_dir);
+
+        // 清理并创建临时目录
+        cleanDir(self.allocator, self.io, temp_dir);
+        std.Io.Dir.cwd().createDirPath(self.io, temp_dir) catch {};
+
+        // 计算线程数，限制范围 1-32
+        const thread_count: u32 = @min(@max(self.config.thread, 1), 32);
+
+        // 初始化共享状态
+        var state = DownloadState.init(illusts_list.len);
+
+        // 构造工作线程上下文
+        var ctx = WorkerContext{
+            .allocator = self.allocator,
+            .io = self.io,
+            .http = self.http,
+            .state = &state,
+            .illusts = illusts_list,
+            .temp_dir = temp_dir,
+            .final_dir = dir,
+        };
+
+        terminal.logInfo(self.io, "开始下载 {d} 个文件，使用 {d} 个线程...", .{ illusts_list.len, thread_count });
+
+        // 生成工作线程
+        var threads = std.ArrayListUnmanaged(std.Thread).empty;
+        defer threads.deinit(self.allocator);
+
+        for (0..thread_count) |_| {
+            const handle = std.Thread.spawn(.{}, workerFunc, .{&ctx}) catch continue;
+            threads.append(self.allocator, handle) catch {
+                handle.join();
+                continue;
+            };
+        }
+
+        // 等待所有工作线程完成
+        for (threads.items) |handle| {
+            handle.join();
+        }
+
+        // 清理临时目录
+        cleanDir(self.allocator, self.io, temp_dir);
+
+        // 输出下载结果摘要
+        const success = state.success_count.load(.monotonic);
+        const skipped = state.skip_count.load(.monotonic);
+        const errors = state.error_count.load(.monotonic);
+        terminal.logInfo(self.io, "下载完成: 成功 {d}, 跳过 {d}, 失败 {d} / 共 {d}", .{ success, skipped, errors, illusts_list.len });
+    }
+
+    /// 根据画师列表下载所有插画
+    /// illustrators: 画师指针数组
+    /// pixiv_api: Pixiv API 客户端实例
+    pub fn downloadByIllustrators(self: *Downloader, illustrators: []*illustrator.Illustrator, api: *pixiv_api.PixivApi) !void {
+        const base_dir = self.config.path orelse return error.DownloadPathNotSet;
+
+        for (illustrators, 0..) |artist, idx| {
+            terminal.logInfo(self.io, "[{d}/{d}] 处理画师 {d}...", .{ idx + 1, illustrators.len, artist.id });
+
+            // 获取画师信息，失败则跳过（可能是已注销账号）
+            const info = artist.fetchInfo(api) catch |err| {
+                terminal.logError(self.io, "获取画师 {d} 信息失败: {s}，跳过", .{ artist.id, @errorName(err) });
+                continue;
+            };
+            defer info.deinit();
+
+            // 确定画师目录路径
+            const artist_dir = self.getIllustratorNewDir(info, base_dir) catch |err| {
+                terminal.logError(self.io, "创建画师目录失败: {s}", .{@errorName(err)});
+                continue;
+            };
+            defer self.allocator.free(artist_dir);
+
+            terminal.logInfo(self.io, "画师目录: {s}", .{artist_dir});
+
+            // 收集所有插画（分页遍历）
+            var all_illusts = std.ArrayListUnmanaged(illust.Illust).empty;
+            defer {
+                for (all_illusts.items) |item| item.deinit(self.allocator);
+                all_illusts.deinit(self.allocator);
+            }
+
+            while (true) {
+                const items = artist.illusts(api) catch |err| {
+                    terminal.logError(self.io, "获取画师 {d} 插画列表失败: {s}", .{ artist.id, @errorName(err) });
+                    break;
+                };
+
+                if (items.len == 0) {
+                    illust.deinitIllusts(self.allocator, items);
+                    break;
+                }
+
+                for (items) |item| {
+                    all_illusts.append(self.allocator, item) catch {};
+                }
+                self.allocator.free(items);
+
+                if (!artist.hasNext(.illust)) break;
+            }
+
+            if (all_illusts.items.len == 0) {
+                terminal.logInfo(self.io, "画师 {d} 无插画，跳过", .{artist.id});
+                continue;
+            }
+
+            terminal.logInfo(self.io, "画师 {s} 共 {d} 个文件待下载", .{ info.name, all_illusts.items.len });
+
+            // 执行下载
+            self.downloadIllusts(all_illusts.items, artist_dir) catch |err| {
+                terminal.logError(self.io, "下载画师 {s} 的插画失败: {s}", .{ info.name, @errorName(err) });
+            };
+        }
+    }
+
+    /// 下载收藏插画
+    /// me: 当前登录用户（画师对象）
+    /// is_private: 是否为私密收藏
+    /// api: Pixiv API 客户端实例
+    pub fn downloadByBookmark(self: *Downloader, me: *illustrator.Illustrator, is_private: bool, api: *pixiv_api.PixivApi) !void {
+        const base_dir = self.config.path orelse return error.DownloadPathNotSet;
+
+        // 确定收藏目录名
+        const bookmark_dir_name = if (is_private) "[bookmark] Private" else "[bookmark] Public";
+        const bookmark_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, bookmark_dir_name });
+        defer self.allocator.free(bookmark_dir);
+
+        terminal.logInfo(self.io, "下载{d}收藏到: {s}", .{ if (is_private) @as(u32, 1) else @as(u32, 0), bookmark_dir_name });
+
+        // 收集所有收藏插画（分页遍历）
+        var all_illusts = std.ArrayListUnmanaged(illust.Illust).empty;
+        defer {
+            for (all_illusts.items) |item| item.deinit(self.allocator);
+            all_illusts.deinit(self.allocator);
+        }
+
+        while (true) {
+            const items = me.bookmarks(api) catch |err| {
+                terminal.logError(self.io, "获取收藏列表失败: {s}", .{@errorName(err)});
+                break;
+            };
+
+            if (items.len == 0) {
+                illust.deinitIllusts(self.allocator, items);
+                break;
+            }
+
+            for (items) |item| {
+                all_illusts.append(self.allocator, item) catch {};
+            }
+            self.allocator.free(items);
+
+            if (!me.hasNext(.bookmark)) break;
+        }
+
+        if (all_illusts.items.len == 0) {
+            terminal.logInfo(self.io, "无收藏插画", .{});
+            return;
+        }
+
+        terminal.logInfo(self.io, "共 {d} 个收藏文件待下载", .{all_illusts.items.len});
+
+        // 执行下载
+        self.downloadIllusts(all_illusts.items, bookmark_dir) catch |err| {
+            terminal.logError(self.io, "下载收藏插画失败: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// 确定画师目录名称
+    /// 规则:
+    ///   - 在 base_dir 中查找以 "(uid)" 开头的子目录
+    ///   - 如果找到且 auto_rename 为 true 且名称已变更，则重命名目录
+    ///   - 如果未找到，创建新目录名 "(uid)clean_name"
+    /// 返回: 分配的完整路径字符串，调用者负责释放
+    pub fn getIllustratorNewDir(self: *Downloader, info: illustrator.IllustratorInfo, base_dir: []const u8) ![]const u8 {
+        const uid_prefix = try std.fmt.allocPrint(self.allocator, "({d})", .{info.id});
+        defer self.allocator.free(uid_prefix);
+
+        const clean_name = illust.sanitizeArtistName(self.allocator, info.name) catch
+            try self.allocator.dupe(u8, info.name);
+        defer self.allocator.free(clean_name);
+
+        // 在 base_dir 中查找以 "(uid)" 开头的子目录
+        var dir = std.Io.Dir.cwd().openDir(self.io, base_dir, .{ .iterate = true }) catch
+            return self.createArtistDir(base_dir, uid_prefix, clean_name);
+        defer dir.close(self.io);
+
+        var existing_entry: ?[]const u8 = null;
+        var iter = dir.iterate();
+        while (iter.next(self.io) catch null) |entry| {
+            if (entry.kind != .directory) continue;
+            if (std.mem.startsWith(u8, entry.name, uid_prefix)) {
+                // 复制目录名用于后续操作
+                existing_entry = try self.allocator.dupe(u8, entry.name);
+                break;
+            }
+        }
+
+        if (existing_entry) |existing_name| {
+            // 已找到以 "(uid)" 开头的目录
+            const expected_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ uid_prefix, clean_name });
+
+            if (self.config.auto_rename and !std.mem.eql(u8, existing_name, expected_name)) {
+                // 画师改名，需要重命名目录
+                const old_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, existing_name });
+                const new_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, expected_name });
+
+                renameDir(self.io, old_path, new_path) catch {
+                    // 重命名失败，使用旧路径
+                    self.allocator.free(new_path);
+                    self.allocator.free(expected_name);
+                    const result = old_path;
+                    self.allocator.free(existing_name);
+                    return result;
+                };
+
+                self.allocator.free(old_path);
+                self.allocator.free(existing_name);
+                // 返回新路径
+                return new_path;
+            }
+
+            self.allocator.free(expected_name);
+            // 使用现有目录路径
+            const result = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, existing_name });
+            self.allocator.free(existing_name);
+            return result;
+        }
+
+        // 未找到现有目录，创建新目录名
+        return self.createArtistDir(base_dir, uid_prefix, clean_name);
+    }
+
+    /// 构造画师目录路径并确保目录存在
+    fn createArtistDir(self: *Downloader, base_dir: []const u8, uid_prefix: []const u8, clean_name: []const u8) ![]const u8 {
+        const dir_name = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ uid_prefix, clean_name });
+        errdefer self.allocator.free(dir_name);
+
+        const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, dir_name });
+        self.allocator.free(dir_name);
+
+        // 确保目录存在
+        std.Io.Dir.cwd().createDirPath(self.io, full_path) catch {};
+
+        return full_path;
+    }
+};
+
+/// 工作线程主函数
+/// 每个线程循环从共享状态中获取下一个任务索引，执行下载
+/// 下载成功或 404 跳过后继续下一个任务
+/// 重试耗尽时递增错误计数，可能触发全局暂停
+fn workerFunc(ctx: *WorkerContext) void {
+    const referer_header = std.http.Header{ .name = "referer", .value = REFERER };
+
+    while (true) {
+        // 检查全局暂停标志
+        if (ctx.state.is_paused.load(.acquire)) {
+            std.Io.sleep(ctx.io, .fromSeconds(300), .real) catch {};
+            ctx.state.is_paused.store(false, .release);
+            continue;
+        }
+
+        // 原子获取下一个任务索引
+        const i = ctx.state.next_index.fetchAdd(1, .monotonic);
+        if (i >= ctx.state.total_count) break;
+
+        const item = ctx.illusts[i];
+
+        // 检查最终文件是否已存在（跳过已下载的文件）
+        const final_path = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.final_dir, item.file }) catch continue;
+        defer ctx.allocator.free(final_path);
+
+        if (fileExists(ctx.io, final_path)) {
+            _ = ctx.state.skip_count.fetchAdd(1, .monotonic);
+            continue;
+        }
+
+        // 构造临时文件路径
+        const temp_path = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.temp_dir, item.file }) catch continue;
+        defer ctx.allocator.free(temp_path);
+
+        // 重试下载
+        var retry: u32 = 0;
+        var download_ok = false;
+        var is_404 = false;
+
+        while (retry <= MAX_RETRY) : (retry += 1) {
+            // 检查全局暂停（重试前）
+            if (ctx.state.is_paused.load(.acquire)) {
+                std.Io.sleep(ctx.io, .fromSeconds(300), .real) catch {};
+                ctx.state.is_paused.store(false, .release);
+                continue;
+            }
+
+            // 发起 HTTP GET 请求下载文件
+            const resp = ctx.http.get(item.url, &.{referer_header}) catch {
+                // 网络错误，等待后重试
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            };
+            defer resp.deinit();
+
+            // 检查 HTTP 状态码
+            const status_code = @intFromEnum(resp.status);
+
+            if (status_code == 404) {
+                // 404 立即跳过，不重试
+                is_404 = true;
+                terminal.logError(ctx.io, "404 未找到: {s}", .{item.file});
+                break;
+            }
+
+            if (status_code < 200 or status_code >= 300) {
+                // 非 2xx 响应，重试
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            }
+
+            // 检查响应体是否为空
+            if (resp.body.len == 0) {
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            }
+
+            // 将响应体写入临时文件
+            writeFile(ctx.io, temp_path, resp.body) catch {
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            };
+
+            // 校验文件大小（读取刚写入的文件大小确认写入成功）
+            const written_size = getFileSize(ctx.io, temp_path) catch 0;
+            if (written_size != resp.body.len) {
+                // 大小不匹配，删除临时文件并重试
+                deleteFile(ctx.io, temp_path);
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            }
+
+            // 将临时文件移动到最终目录
+            moveFile(ctx.io, temp_path, final_path) catch {
+                // 移动失败，删除临时文件后重试
+                deleteFile(ctx.io, temp_path);
+                std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
+                continue;
+            };
+
+            download_ok = true;
+            break;
+        }
+
+        if (download_ok) {
+            _ = ctx.state.success_count.fetchAdd(1, .monotonic);
+        } else if (is_404) {
+            _ = ctx.state.skip_count.fetchAdd(1, .monotonic);
+        } else {
+            // 重试耗尽
+            _ = ctx.state.error_count.fetchAdd(1, .monotonic);
+            terminal.logError(ctx.io, "下载失败（重试 {d} 次）: {s}", .{ retry, item.file });
+
+            // 超过 1 个线程出错时触发全局暂停
+            if (ctx.state.error_count.load(.monotonic) > 1) {
+                ctx.state.is_paused.store(true, .release);
+            }
+
+            // 清理可能残留的临时文件
+            deleteFile(ctx.io, temp_path);
+        }
+    }
+}
+
+// ==================== 文件系统辅助函数 ====================
+
+/// 检查文件是否存在
+fn fileExists(io: std.Io, path: []const u8) bool {
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    file.close(io);
+    return true;
+}
+
+/// 将字节数据写入文件（覆盖已存在的文件）
+fn writeFile(io: std.Io, path: []const u8, data: []const u8) !void {
+    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
+    var buf: [8192]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(data);
+    try writer.flush();
+}
+
+/// 获取文件大小
+fn getFileSize(io: std.Io, path: []const u8) !u64 {
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    return reader.getSize();
+}
+
+/// 移动文件（先尝试 rename，失败则复制+删除）
+fn moveFile(io: std.Io, src: []const u8, dst: []const u8) !void {
+    // 先尝试原子 rename
+    std.Io.Dir.rename(std.Io.Dir.cwd(), src, std.Io.Dir.cwd(), dst, io) catch {
+        // rename 失败（可能跨设备），改用复制+删除
+        const src_file = std.Io.Dir.cwd().openFile(io, src, .{}) catch |err| return err;
+        defer src_file.close(io);
+
+        var read_buf: [8192]u8 = undefined;
+        var src_reader = src_file.reader(io, &read_buf);
+
+        const dst_file = std.Io.Dir.cwd().createFile(io, dst, .{}) catch |err| return err;
+        errdefer deleteFile(io, dst);
+        defer dst_file.close(io);
+
+        var write_buf: [8192]u8 = undefined;
+        var dst_writer = dst_file.writer(io, &write_buf);
+
+        // 流式复制
+        const stat = src_reader.getSize() catch |err| return err;
+        var remaining: u64 = @intCast(stat);
+        while (remaining > 0) {
+            const to_read: usize = @min(remaining, read_buf.len);
+            const chunk = src_reader.interface.take(to_read) catch |err| return err;
+            dst_writer.interface.writeAll(chunk) catch |err| return err;
+            remaining -= to_read;
+        }
+        try dst_writer.flush();
+
+        // 删除源文件
+        deleteFile(io, src);
+    };
+}
+
+/// 删除文件
+fn deleteFile(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+}
+
+/// 重命名目录
+fn renameDir(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
+    std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io) catch |err| return err;
+}
+
+/// 清理目录中的所有文件和子目录
+fn cleanDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) void {
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+    defer dir.close(io);
+
+    var iter = dir.iterate();
+    while (iter.next(io) catch null) |entry| {
+        const entry_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+        defer allocator.free(entry_path);
+
+        switch (entry.kind) {
+            .file => {
+                deleteFile(io, entry_path);
+            },
+            .directory => {
+                // 递归清理子目录
+                cleanDir(allocator, io, entry_path);
+                std.Io.Dir.cwd().deleteDir(io, entry_path) catch {};
+            },
+            else => {},
+        }
+    }
+}
