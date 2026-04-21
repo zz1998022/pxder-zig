@@ -1,0 +1,235 @@
+name: Bootstrap WinGet Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "要提交到 WinGet 的 Release 标签，例如 v0.1.0"
+        required: true
+        default: "v0.1.0"
+
+permissions:
+  contents: read
+
+jobs:
+  submit-initial-manifest:
+    name: Submit Initial WinGet Manifest
+    runs-on: windows-latest
+    env:
+      PACKAGE_IDENTIFIER: ${{ vars.WINGET_PACKAGE_IDENTIFIER }}
+      WINGET_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+      FORK_OWNER: ${{ github.repository_owner }}
+      UPSTREAM_REPO: microsoft/winget-pkgs
+      PACKAGE_NAME: pxder
+      PUBLISHER: Lemon
+      MONIKER: pxder
+      SHORT_DESCRIPTION: High-performance Pixiv illustration downloader written in Zig.
+      LICENSE_NAME: GPL-3.0-only
+      PACKAGE_URL: https://github.com/zz1998022/pxder-zig
+      LICENSE_URL: https://github.com/zz1998022/pxder-zig/blob/main/LICENSE
+      PUBLISHER_URL: https://github.com/zz1998022
+      MANIFEST_VERSION: 1.12.0
+    steps:
+      - name: Validate workflow configuration
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PACKAGE_IDENTIFIER)) {
+            throw "缺少仓库变量 WINGET_PACKAGE_IDENTIFIER"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
+            throw "缺少仓库机密 WINGET_CREATE_GITHUB_TOKEN"
+          }
+
+      - name: Resolve release metadata
+        id: release
+        shell: pwsh
+        run: |
+          $tagName = "${{ github.event.inputs.release_tag }}"
+          if (-not $tagName.StartsWith("v")) {
+            throw "Release 标签必须以 v 开头，例如 v0.1.0"
+          }
+
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = "application/vnd.github+json"
+            "User-Agent" = "pxder-zig-winget-bootstrap"
+          }
+          $release = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/${{ github.repository }}/releases/tags/$tagName"
+
+          $appVersion = $tagName.Substring(1)
+          $assetName = "pxder-v$appVersion-windows-x64.zip"
+          $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+          if (-not $asset) {
+            throw "未找到 Release 资产 $assetName"
+          }
+
+          $digest = $asset.digest
+          if ([string]::IsNullOrWhiteSpace($digest) -or -not $digest.StartsWith("sha256:")) {
+            throw "Release 资产未提供 sha256 digest"
+          }
+
+          $publishedAt = [DateTimeOffset]::Parse($release.published_at).UtcDateTime.ToString("yyyy-MM-dd")
+          "tag_name=$tagName" >> $env:GITHUB_OUTPUT
+          "app_version=$appVersion" >> $env:GITHUB_OUTPUT
+          "asset_url=$($asset.browser_download_url)" >> $env:GITHUB_OUTPUT
+          "asset_sha256=$($digest.Substring(7).ToUpperInvariant())" >> $env:GITHUB_OUTPUT
+          "release_date=$publishedAt" >> $env:GITHUB_OUTPUT
+
+      - name: Fork winget-pkgs if needed
+        shell: pwsh
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = "application/vnd.github+json"
+            "User-Agent" = "pxder-zig-winget-bootstrap"
+          }
+
+          try {
+            Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:FORK_OWNER/winget-pkgs" | Out-Null
+            Write-Host "Fork already exists."
+          } catch {
+            Write-Host "Creating fork..."
+            Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/$env:UPSTREAM_REPO/forks" | Out-Null
+          }
+
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:FORK_OWNER/winget-pkgs" | Out-Null
+              Write-Host "Fork is ready."
+              exit 0
+            } catch {
+              Start-Sleep -Seconds 5
+            }
+          }
+
+          throw "等待 fork 创建超时"
+
+      - name: Clone fork and create bootstrap branch
+        shell: pwsh
+        run: |
+          $branchName = "winget-bootstrap-${{ steps.release.outputs.app_version }}"
+          $repoUrl = "https://x-access-token:$env:WINGET_TOKEN@github.com/$env:FORK_OWNER/winget-pkgs.git"
+          git clone --depth 1 $repoUrl winget-pkgs
+          Set-Location winget-pkgs
+          git checkout -b $branchName
+          git config user.name "${{ github.repository_owner }}"
+          git config user.email "${{ github.repository_owner }}@users.noreply.github.com"
+          "branch_name=$branchName" >> $env:GITHUB_OUTPUT
+        id: branch
+
+      - name: Write initial manifest files
+        shell: pwsh
+        run: |
+          $pkgId = $env:PACKAGE_IDENTIFIER
+          $version = "${{ steps.release.outputs.app_version }}"
+          $releaseDate = "${{ steps.release.outputs.release_date }}"
+          $assetUrl = "${{ steps.release.outputs.asset_url }}"
+          $sha256 = "${{ steps.release.outputs.asset_sha256 }}"
+
+          $parts = $pkgId.Split(".")
+          $manifestRoot = Join-Path "winget-pkgs/manifests" ($parts[0].Substring(0, 1).ToLowerInvariant())
+          foreach ($part in $parts) {
+            $manifestRoot = Join-Path $manifestRoot $part
+          }
+          $manifestRoot = Join-Path $manifestRoot $version
+          New-Item -ItemType Directory -Force -Path $manifestRoot | Out-Null
+
+          $versionFile = Join-Path $manifestRoot "$pkgId.yaml"
+          $installerFile = Join-Path $manifestRoot "$pkgId.installer.yaml"
+          $localeFile = Join-Path $manifestRoot "$pkgId.locale.en-US.yaml"
+
+          @"
+# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.version.$env:MANIFEST_VERSION.schema.json
+
+PackageIdentifier: $pkgId
+PackageVersion: $version
+DefaultLocale: en-US
+ManifestType: version
+ManifestVersion: $env:MANIFEST_VERSION
+"@ | Set-Content -Path $versionFile -Encoding utf8NoBOM
+
+          @"
+# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.installer.$env:MANIFEST_VERSION.schema.json
+
+PackageIdentifier: $pkgId
+PackageVersion: $version
+InstallerType: zip
+NestedInstallerType: portable
+Commands:
+- $env:MONIKER
+ReleaseDate: $releaseDate
+Installers:
+- Architecture: x64
+  NestedInstallerFiles:
+  - RelativeFilePath: pxder.exe
+    PortableCommandAlias: $env:MONIKER
+  InstallerUrl: $assetUrl
+  InstallerSha256: $sha256
+ManifestType: installer
+ManifestVersion: $env:MANIFEST_VERSION
+"@ | Set-Content -Path $installerFile -Encoding utf8NoBOM
+
+          @"
+# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.defaultLocale.$env:MANIFEST_VERSION.schema.json
+
+PackageIdentifier: $pkgId
+PackageVersion: $version
+PackageLocale: en-US
+Publisher: $env:PUBLISHER
+PublisherUrl: $env:PUBLISHER_URL
+PackageName: $env:PACKAGE_NAME
+PackageUrl: $env:PACKAGE_URL
+License: $env:LICENSE_NAME
+LicenseUrl: $env:LICENSE_URL
+ShortDescription: $env:SHORT_DESCRIPTION
+Moniker: $env:MONIKER
+Tags:
+- pixiv
+- downloader
+- cli
+- zig
+ManifestType: defaultLocale
+ManifestVersion: $env:MANIFEST_VERSION
+"@ | Set-Content -Path $localeFile -Encoding utf8NoBOM
+
+      - name: Commit and push bootstrap branch
+        shell: pwsh
+        run: |
+          Set-Location winget-pkgs
+          git add .
+          git commit -m "Add $env:PACKAGE_IDENTIFIER version ${{ steps.release.outputs.app_version }}"
+          git push origin "${{ steps.branch.outputs.branch_name }}"
+
+      - name: Create pull request
+        shell: pwsh
+        run: |
+          $headers = @{
+            Authorization = "Bearer $env:WINGET_TOKEN"
+            Accept = "application/vnd.github+json"
+            "User-Agent" = "pxder-zig-winget-bootstrap"
+          }
+
+          $title = "New package: $env:PACKAGE_IDENTIFIER version ${{ steps.release.outputs.app_version }}"
+          $body = @"
+## Checklist
+- [x] I have verified that the installer is publicly accessible
+- [x] I have verified the SHA256 and manifest metadata against the GitHub Release asset
+
+This PR bootstraps the first WinGet package submission for `pxder`.
+"@
+
+          $existing = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:UPSTREAM_REPO/pulls?state=open&head=$env:FORK_OWNER:${{ steps.branch.outputs.branch_name }}" 
+          if ($existing.Count -gt 0) {
+            Write-Host "PR already exists: $($existing[0].html_url)"
+            exit 0
+          }
+
+          $payload = @{
+            title = $title
+            head = "${env:FORK_OWNER}:${{ steps.branch.outputs.branch_name }}"
+            base = "master"
+            body = $body
+          } | ConvertTo-Json
+
+          $pr = Invoke-RestMethod -Method Post -Headers $headers -Uri "https://api.github.com/repos/$env:UPSTREAM_REPO/pulls" -Body $payload
+          Write-Host "Created PR: $($pr.html_url)"

@@ -48,7 +48,7 @@ jobs:
           }
 
           $appVersion = $tagName.Substring(1)
-          $expectedAssetName = "pxder-v$appVersion-windows-x64.exe"
+          $expectedAssetName = "pxder-v$appVersion-windows-x64.zip"
           $asset = $event.release.assets | Where-Object { $_.name -eq $expectedAssetName } | Select-Object -First 1
 
           if (-not $asset) {

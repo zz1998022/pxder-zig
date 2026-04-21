@@ -79,7 +79,8 @@ zig build run -- --help
 仓库内置了两条 GitHub Actions 工作流：
 
 - [release.yml](.github/workflows/release.yml)：当推送 `v*` 标签时，自动校验版本号、下载 Zig 0.16.0、运行测试、构建 Windows x64 版本，并创建或更新 GitHub Release。
-- [winget.yml](.github/workflows/winget.yml)：当 GitHub Release 发布后，自动读取对应的 Windows 可执行文件资产，并调用 `wingetcreate update --submit` 向 `winget-pkgs` 提交更新 PR。
+- [winget.yml](.github/workflows/winget.yml)：当 GitHub Release 发布后，自动读取对应的 Windows `zip` 便携包资产，并调用 `wingetcreate update --submit` 向 `winget-pkgs` 提交更新 PR。
+- [winget-bootstrap.yml](.github/workflows/winget-bootstrap.yml)：用于首个版本尚未被 WinGet 收录时，一次性 fork `winget-pkgs`、写入初始 manifest 并创建首发 PR。
 
 ### Release 触发方式
 
@@ -92,10 +93,10 @@ git push origin main --tags
 
 工作流会生成两个固定命名的资产：
 
-- `pxder-v2.12.11-windows-x64.exe`
 - `pxder-v2.12.11-windows-x64.zip`
+- `pxder-v2.12.11-windows-x64.exe`
 
-其中 `.exe` 资产会作为 WinGet 更新源使用。
+其中 `zip` 资产会作为 WinGet 的 portable 安装源使用，`.exe` 资产保留给直接下载用户。
 
 ### 启用 WinGet 自动更新
 
@@ -108,9 +109,23 @@ git push origin main --tags
 
 ### 首次接入说明
 
-当前自动化流程默认使用 `wingetcreate update --submit`，适合 **已经被 winget 收录过** 的包。
+常规更新流程使用 `wingetcreate update --submit`，适合 **已经被 winget 收录过** 的包。
 
-如果 `pxder` 还没有首次进入 `winget-pkgs`，建议先手动完成一次初始 manifest 提交；等首个包被合并后，后续版本就可以完全交给这套 Action 自动更新。
+如果 `pxder` 还没有首次进入 `winget-pkgs`，先手动在 GitHub Actions 里运行一次 [winget-bootstrap.yml](.github/workflows/winget-bootstrap.yml)：
+
+1. 打开 `Actions`
+2. 选择 `Bootstrap WinGet Package`
+3. 点击 `Run workflow`
+4. 输入目标 Release 标签，例如 `v0.1.0`
+
+这个 bootstrap 工作流会自动：
+
+- 查询对应 Release 的 `zip` 资产与 SHA256
+- 如有需要自动 fork `microsoft/winget-pkgs`
+- 生成 `zz1998022.pxder` 的首发 manifest
+- 推送分支并创建首发 PR
+
+等首个 PR 被合并后，后续版本就可以完全交给 `winget.yml` 自动更新。
 
 ## 使用方法
 
