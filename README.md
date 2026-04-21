@@ -186,21 +186,45 @@ pxder -p 70593670,70594912
 
 ```
 src/
-  main.zig             CLI 入口，参数解析，命令分发
-  config.zig           配置文件读写，跨平台路径解析
-  pixiv_api.zig        Pixiv API 客户端（认证头、重试、限流）
-  auth.zig             OAuth PKCE 流程，token 管理
-  http_client.zig      HTTP 客户端封装（代理 + TLS 隧道）
-  proxy.zig            代理解析（HTTP CONNECT / SOCKS5）
-  downloader.zig       多线程下载引擎
-  illust.zig           插画数据模型（单图/多图/动图 URL 构造）
-  illustrator.zig      画师数据模型，分页逻辑
-  tools.zig            文件下载，临时目录管理
-  terminal.zig         ANSI 颜色，终端交互
-  json_utils.zig       JSON 安全解析辅助
-  crypto.zig           SHA-256, MD5, base64url
-  protocol.zig         Windows pixiv:// 协议处理器
-  update_checker.zig   版本检查
+  main.zig                          CLI 入口
+  auth.zig                          OAuth PKCE 流程，token 管理
+  pixiv_api.zig                     Pixiv API 客户端（认证头、重试、限流）
+  app/
+    context.zig                     共享上下文（配置、HTTP、API 资源管理）
+    runner.zig                      命令分发
+  cli/
+    args.zig                        CLI 参数类型定义
+    parser.zig                      参数解析
+    help.zig                        帮助信息
+    commands/
+      login.zig                     登录 / 令牌登录
+      setting.zig                   交互式设置
+      download_uid.zig              按画师 UID 下载
+      download_pid.zig              按插画 PID 下载
+      follow.zig                    下载关注画师
+      bookmark.zig                  下载收藏
+      update.zig                    增量更新
+      export_token.zig              导出令牌
+      version.zig                   版本信息
+  core/
+    illust.zig                      插画数据模型（单图/多图/动图 URL 构造）
+    illustrator.zig                 画师数据模型，分页逻辑
+    protocol.zig                    Windows pixiv:// 协议处理器
+  services/
+    download_service.zig            多线程下载引擎
+  infra/
+    http/
+      http_client.zig               HTTP 客户端封装（代理 + TLS 隧道）
+      proxy.zig                     代理解析（HTTP CONNECT / SOCKS5）
+    storage/
+      config.zig                    配置文件读写，跨平台路径解析
+      fs.zig                        文件系统操作（读写、移动、清理）
+  shared/
+    terminal.zig                    ANSI 颜色，终端交互
+    json_utils.zig                  JSON 安全解析辅助
+    tools.zig                       文件下载，临时目录管理
+    crypto.zig                      SHA-256, MD5, base64url
+    update_checker.zig              版本检查
 ```
 
 ## 技术细节

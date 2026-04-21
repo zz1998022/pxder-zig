@@ -2,7 +2,7 @@
 //! 提供文件下载、临时目录管理、UgoiraDir 辅助类等功能。
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("../infra/http/http_client.zig");
 
 /// 创建目录路径（mkdir -p），已存在时忽略
 pub fn ensureDir(io: std.Io, path: []const u8) void {

@@ -6,7 +6,7 @@
 //!   Linux:   $XDG_CONFIG_HOME/pxder-zig/config.json 或 ~/.config/pxder-zig/config.json
 
 const std = @import("std");
-const json_utils = @import("json_utils.zig");
+const json_utils = @import("../../shared/json_utils.zig");
 const builtin = @import("builtin");
 
 /// 下载相关配置

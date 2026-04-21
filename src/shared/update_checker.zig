@@ -3,9 +3,9 @@
 //! 结果缓存到本地文件，3 天内不重复请求。
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
+const http_client = @import("../infra/http/http_client.zig");
 const json_utils = @import("json_utils.zig");
-const config = @import("config.zig");
+const config = @import("../infra/storage/config.zig");
 
 /// 缓存有效期：3 天（单位：秒）
 const cache_ttl_seconds: i64 = 3 * 24 * 60 * 60;

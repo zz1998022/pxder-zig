@@ -17,9 +17,9 @@
 //!   }
 
 const std = @import("std");
-const json_utils = @import("json_utils.zig");
+const json_utils = @import("../shared/json_utils.zig");
 const illust_mod = @import("illust.zig");
-const pixiv_api = @import("pixiv_api.zig");
+const pixiv_api = @import("../pixiv_api.zig");
 
 /// 画师信息
 pub const IllustratorInfo = struct {

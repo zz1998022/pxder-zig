@@ -16,12 +16,13 @@
 //!   格式为 "(uid)clean_name"，画师改名时可根据 auto_rename 配置自动重命名
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
-const config = @import("config.zig");
-const illust = @import("illust.zig");
-const illustrator = @import("illustrator.zig");
-const pixiv_api = @import("pixiv_api.zig");
-const terminal = @import("terminal.zig");
+const http_client = @import("../infra/http/http_client.zig");
+const config = @import("../infra/storage/config.zig");
+const illust = @import("../core/illust.zig");
+const illustrator = @import("../core/illustrator.zig");
+const pixiv_api = @import("../pixiv_api.zig");
+const terminal = @import("../shared/terminal.zig");
+const fs = @import("../infra/storage/fs.zig");
 
 /// 最大重试次数
 const MAX_RETRY: u32 = 10;
@@ -63,7 +64,7 @@ pub const DownloadState = struct {
 const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    proxy_config: ?@import("proxy.zig").ProxyConfig,
+    proxy_config: ?@import("../infra/http/proxy.zig").ProxyConfig,
     state: *DownloadState,
     illusts: []const illust.Illust,
     temp_dir: []const u8,
@@ -77,10 +78,10 @@ pub const Downloader = struct {
     io: std.Io,
     config: config.DownloadConfig,
     http: *http_client.HttpClient,
-    proxy_config: ?@import("proxy.zig").ProxyConfig,
+    proxy_config: ?@import("../infra/http/proxy.zig").ProxyConfig,
 
     /// 初始化下载管理器
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.DownloadConfig, http: *http_client.HttpClient, proxy_cfg: ?@import("proxy.zig").ProxyConfig) Downloader {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.DownloadConfig, http: *http_client.HttpClient, proxy_cfg: ?@import("../infra/http/proxy.zig").ProxyConfig) Downloader {
         return .{
             .allocator = allocator,
             .io = io,
@@ -107,7 +108,7 @@ pub const Downloader = struct {
         defer self.allocator.free(temp_dir);
 
         // 清理并创建临时目录
-        cleanDir(self.allocator, self.io, temp_dir);
+        fs.cleanDir(self.allocator, self.io, temp_dir);
         std.Io.Dir.cwd().createDirPath(self.io, temp_dir) catch {};
 
         // 计算线程数，限制范围 1-32
@@ -153,7 +154,7 @@ pub const Downloader = struct {
         }
 
         // 清理临时目录
-        cleanDir(self.allocator, self.io, temp_dir);
+        fs.cleanDir(self.allocator, self.io, temp_dir);
 
         // 输出下载结果摘要
         const success = state.success_count.load(.monotonic);
@@ -319,7 +320,7 @@ pub const Downloader = struct {
                 const old_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, existing_name });
                 const new_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ base_dir, expected_name });
 
-                renameDir(self.io, old_path, new_path) catch {
+                fs.renameDir(self.io, old_path, new_path) catch {
                     // 重命名失败，使用旧路径
                     self.allocator.free(new_path);
                     self.allocator.free(expected_name);
@@ -387,7 +388,7 @@ fn workerFunc(ctx: *WorkerContext) void {
         defer ctx.allocator.free(final_path);
 
         // 跳过已存在的文件
-        if (fileExists(ctx.io, final_path)) {
+        if (fs.fileExists(ctx.io, final_path)) {
             _ = ctx.state.skip_count.fetchAdd(1, .monotonic);
             const done = ctx.state.completed_count.fetchAdd(1, .monotonic) + 1;
             printProgress(ctx.io, ctx.thread_id, done, total, item.id, item.title, "exists");
@@ -431,20 +432,20 @@ fn workerFunc(ctx: *WorkerContext) void {
                 continue;
             }
 
-            writeFile(ctx.io, temp_path, resp.body) catch {
+            fs.writeFile(ctx.io, temp_path, resp.body) catch {
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             };
 
-            const written_size = getFileSize(ctx.io, temp_path) catch 0;
+            const written_size = fs.getFileSize(ctx.io, temp_path) catch 0;
             if (written_size != resp.body.len) {
-                deleteFile(ctx.io, temp_path);
+                fs.deleteFile(ctx.io, temp_path);
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             }
 
-            moveFile(ctx.io, temp_path, final_path) catch {
-                deleteFile(ctx.io, temp_path);
+            fs.moveFile(ctx.io, temp_path, final_path) catch {
+                fs.deleteFile(ctx.io, temp_path);
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             };
@@ -470,7 +471,7 @@ fn workerFunc(ctx: *WorkerContext) void {
                 ctx.state.is_paused.store(true, .release);
             }
 
-            deleteFile(ctx.io, temp_path);
+            fs.deleteFile(ctx.io, temp_path);
         }
     }
 }
@@ -491,100 +492,4 @@ fn printProgress(io: std.Io, thread_id: u32, done: u32, total: usize, pid: u64, 
     fw.interface.writeAll(terminal.colorCode(.reset)) catch {};
     fw.interface.writeAll("\n") catch {};
     fw.flush() catch {};
-}
-
-// ==================== 文件系统辅助函数 ====================
-
-/// 检查文件是否存在
-fn fileExists(io: std.Io, path: []const u8) bool {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
-    file.close(io);
-    return true;
-}
-
-/// 将字节数据写入文件（覆盖已存在的文件）
-fn writeFile(io: std.Io, path: []const u8, data: []const u8) !void {
-    const file = try std.Io.Dir.cwd().createFile(io, path, .{});
-    defer file.close(io);
-    var buf: [8192]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(data);
-    try writer.flush();
-}
-
-/// 获取文件大小
-fn getFileSize(io: std.Io, path: []const u8) !u64 {
-    const file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var reader = file.reader(io, &buf);
-    return reader.getSize();
-}
-
-/// 移动文件（先尝试 rename，失败则复制+删除）
-fn moveFile(io: std.Io, src: []const u8, dst: []const u8) !void {
-    // 先尝试原子 rename
-    std.Io.Dir.rename(std.Io.Dir.cwd(), src, std.Io.Dir.cwd(), dst, io) catch {
-        // rename 失败（可能跨设备），改用复制+删除
-        const src_file = std.Io.Dir.cwd().openFile(io, src, .{}) catch |err| return err;
-        defer src_file.close(io);
-
-        var read_buf: [8192]u8 = undefined;
-        var src_reader = src_file.reader(io, &read_buf);
-
-        const dst_file = std.Io.Dir.cwd().createFile(io, dst, .{}) catch |err| return err;
-        errdefer deleteFile(io, dst);
-        defer dst_file.close(io);
-
-        var write_buf: [8192]u8 = undefined;
-        var dst_writer = dst_file.writer(io, &write_buf);
-
-        // 流式复制
-        const stat = src_reader.getSize() catch |err| return err;
-        var remaining: u64 = @intCast(stat);
-        while (remaining > 0) {
-            const to_read: usize = @min(remaining, read_buf.len);
-            const chunk = src_reader.interface.take(to_read) catch |err| return err;
-            dst_writer.interface.writeAll(chunk) catch |err| return err;
-            remaining -= to_read;
-        }
-        try dst_writer.flush();
-
-        // 删除源文件
-        deleteFile(io, src);
-    };
-}
-
-/// 删除文件
-fn deleteFile(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
-}
-
-/// 重命名目录
-fn renameDir(io: std.Io, old_path: []const u8, new_path: []const u8) !void {
-    std.Io.Dir.rename(std.Io.Dir.cwd(), old_path, std.Io.Dir.cwd(), new_path, io) catch |err| return err;
-}
-
-/// 清理目录中的所有文件和子目录
-fn cleanDir(allocator: std.mem.Allocator, io: std.Io, dir_path: []const u8) void {
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
-    defer dir.close(io);
-
-    var iter = dir.iterate();
-    while (iter.next(io) catch null) |entry| {
-        const entry_path = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
-        defer allocator.free(entry_path);
-
-        switch (entry.kind) {
-            .file => {
-                deleteFile(io, entry_path);
-            },
-            .directory => {
-                // 递归清理子目录
-                cleanDir(allocator, io, entry_path);
-                std.Io.Dir.cwd().deleteDir(io, entry_path) catch {};
-            },
-            else => {},
-        }
-    }
 }

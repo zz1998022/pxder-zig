@@ -11,7 +11,7 @@
 //!   动图:   (12345)标题@100ms.zip  或  (12345)标题.zip
 
 const std = @import("std");
-const json_utils = @import("json_utils.zig");
+const json_utils = @import("../shared/json_utils.zig");
 
 /// 插画类型
 pub const IllustType = enum {

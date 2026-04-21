@@ -19,3 +19,14 @@ Thumbs.db
 # Temp files
 *.tmp
 *.bak
+
+# Test / debug binaries
+*.exe
+*.pdb
+
+# Benchmarks
+benchmark*.ps1
+benchmark*.sh
+
+# Claude Code session
+.claude/

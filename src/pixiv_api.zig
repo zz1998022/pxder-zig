@@ -16,10 +16,10 @@
 //!   - 其他错误: 最多重试 2 次，间隔 1 秒
 
 const std = @import("std");
-const http_client = @import("http_client.zig");
-const json_utils = @import("json_utils.zig");
-const terminal = @import("terminal.zig");
-const crypto = @import("crypto.zig");
+const http_client = @import("infra/http/http_client.zig");
+const json_utils = @import("shared/json_utils.zig");
+const terminal = @import("shared/terminal.zig");
+const crypto = @import("shared/crypto.zig");
 
 /// Pixiv Android 应用 OAuth 凭据
 pub const CLIENT_ID = "MOBrBDS8blbauoSck0ZfDbtuzpyT";

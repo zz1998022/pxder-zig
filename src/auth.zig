@@ -9,7 +9,7 @@
 //!   5. 用 code + code_verifier 交换 access_token 和 refresh_token
 
 const std = @import("std");
-const crypto = @import("crypto.zig");
+const crypto = @import("shared/crypto.zig");
 
 /// PKCE 参数，包含登录所需的所有数据
 pub const PkceParams = struct {

@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const proxy = @import("proxy.zig");
-const terminal = @import("terminal.zig");
+const terminal = @import("../../shared/terminal.zig");
 
 /// HTTP 响应，包含状态码和响应体
 pub const HttpResponse = struct {
