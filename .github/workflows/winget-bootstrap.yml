@@ -138,59 +138,62 @@ jobs:
           $installerFile = Join-Path $manifestRoot "$pkgId.installer.yaml"
           $localeFile = Join-Path $manifestRoot "$pkgId.locale.en-US.yaml"
 
-          @"
-# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.version.$env:MANIFEST_VERSION.schema.json
+          $versionManifest = @(
+            "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$env:MANIFEST_VERSION.schema.json"
+            ""
+            "PackageIdentifier: $pkgId"
+            "PackageVersion: $version"
+            "DefaultLocale: en-US"
+            "ManifestType: version"
+            "ManifestVersion: $env:MANIFEST_VERSION"
+          ) -join "`n"
+          Set-Content -Path $versionFile -Value $versionManifest -Encoding utf8NoBOM
 
-PackageIdentifier: $pkgId
-PackageVersion: $version
-DefaultLocale: en-US
-ManifestType: version
-ManifestVersion: $env:MANIFEST_VERSION
-"@ | Set-Content -Path $versionFile -Encoding utf8NoBOM
+          $installerManifest = @(
+            "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.$env:MANIFEST_VERSION.schema.json"
+            ""
+            "PackageIdentifier: $pkgId"
+            "PackageVersion: $version"
+            "InstallerType: zip"
+            "NestedInstallerType: portable"
+            "Commands:"
+            "- $env:MONIKER"
+            "ReleaseDate: $releaseDate"
+            "Installers:"
+            "- Architecture: x64"
+            "  NestedInstallerFiles:"
+            "  - RelativeFilePath: pxder.exe"
+            "    PortableCommandAlias: $env:MONIKER"
+            "  InstallerUrl: $assetUrl"
+            "  InstallerSha256: $sha256"
+            "ManifestType: installer"
+            "ManifestVersion: $env:MANIFEST_VERSION"
+          ) -join "`n"
+          Set-Content -Path $installerFile -Value $installerManifest -Encoding utf8NoBOM
 
-          @"
-# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.installer.$env:MANIFEST_VERSION.schema.json
-
-PackageIdentifier: $pkgId
-PackageVersion: $version
-InstallerType: zip
-NestedInstallerType: portable
-Commands:
-- $env:MONIKER
-ReleaseDate: $releaseDate
-Installers:
-- Architecture: x64
-  NestedInstallerFiles:
-  - RelativeFilePath: pxder.exe
-    PortableCommandAlias: $env:MONIKER
-  InstallerUrl: $assetUrl
-  InstallerSha256: $sha256
-ManifestType: installer
-ManifestVersion: $env:MANIFEST_VERSION
-"@ | Set-Content -Path $installerFile -Encoding utf8NoBOM
-
-          @"
-# yaml-language-server: `\$schema=https://aka.ms/winget-manifest.defaultLocale.$env:MANIFEST_VERSION.schema.json
-
-PackageIdentifier: $pkgId
-PackageVersion: $version
-PackageLocale: en-US
-Publisher: $env:PUBLISHER
-PublisherUrl: $env:PUBLISHER_URL
-PackageName: $env:PACKAGE_NAME
-PackageUrl: $env:PACKAGE_URL
-License: $env:LICENSE_NAME
-LicenseUrl: $env:LICENSE_URL
-ShortDescription: $env:SHORT_DESCRIPTION
-Moniker: $env:MONIKER
-Tags:
-- pixiv
-- downloader
-- cli
-- zig
-ManifestType: defaultLocale
-ManifestVersion: $env:MANIFEST_VERSION
-"@ | Set-Content -Path $localeFile -Encoding utf8NoBOM
+          $localeManifest = @(
+            "# yaml-language-server: `$schema=https://aka.ms/winget-manifest.defaultLocale.$env:MANIFEST_VERSION.schema.json"
+            ""
+            "PackageIdentifier: $pkgId"
+            "PackageVersion: $version"
+            "PackageLocale: en-US"
+            "Publisher: $env:PUBLISHER"
+            "PublisherUrl: $env:PUBLISHER_URL"
+            "PackageName: $env:PACKAGE_NAME"
+            "PackageUrl: $env:PACKAGE_URL"
+            "License: $env:LICENSE_NAME"
+            "LicenseUrl: $env:LICENSE_URL"
+            "ShortDescription: $env:SHORT_DESCRIPTION"
+            "Moniker: $env:MONIKER"
+            "Tags:"
+            "- pixiv"
+            "- downloader"
+            "- cli"
+            "- zig"
+            "ManifestType: defaultLocale"
+            "ManifestVersion: $env:MANIFEST_VERSION"
+          ) -join "`n"
+          Set-Content -Path $localeFile -Value $localeManifest -Encoding utf8NoBOM
 
       - name: Commit and push bootstrap branch
         shell: pwsh
@@ -210,13 +213,13 @@ ManifestVersion: $env:MANIFEST_VERSION
           }
 
           $title = "New package: $env:PACKAGE_IDENTIFIER version ${{ steps.release.outputs.app_version }}"
-          $body = @"
-## Checklist
-- [x] I have verified that the installer is publicly accessible
-- [x] I have verified the SHA256 and manifest metadata against the GitHub Release asset
-
-This PR bootstraps the first WinGet package submission for `pxder`.
-"@
+          $body = @(
+            "## Checklist"
+            "- [x] I have verified that the installer is publicly accessible"
+            "- [x] I have verified the SHA256 and manifest metadata against the GitHub Release asset"
+            ""
+            "This PR bootstraps the first WinGet package submission for ``pxder``."
+          ) -join "`n"
 
           $existing = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$env:UPSTREAM_REPO/pulls?state=open&head=$env:FORK_OWNER:${{ steps.branch.outputs.branch_name }}" 
           if ($existing.Count -gt 0) {
