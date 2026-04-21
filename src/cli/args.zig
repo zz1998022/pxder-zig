@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version = "2.12.10";
+pub const version = "0.1.0";
 
 pub const CliAction = enum {
     login,
