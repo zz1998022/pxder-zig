@@ -1,9 +1,9 @@
 //! 配置管理模块
 //! 负责应用配置的读取、保存、校验。
 //! 配置文件存储在平台特定的应用数据目录:
-//!   Windows: %APPDATA%/pxder/config.json
-//!   macOS:   ~/Library/Application Support/pxder/config.json
-//!   Linux:   $XDG_CONFIG_HOME/pxder/config.json 或 ~/.config/pxder/config.json
+//!   Windows: %APPDATA%/pxder-zig/config.json
+//!   macOS:   ~/Library/Application Support/pxder-zig/config.json
+//!   Linux:   $XDG_CONFIG_HOME/pxder-zig/config.json 或 ~/.config/pxder-zig/config.json
 
 const std = @import("std");
 const json_utils = @import("json_utils.zig");
@@ -59,7 +59,7 @@ pub const AppConfig = struct {
                 }
             },
         };
-        const result = try std.fmt.allocPrint(allocator, "{s}/pxder", .{base});
+        const result = try std.fmt.allocPrint(allocator, "{s}/pxder-zig", .{base});
         if (needs_free) allocator.free(@constCast(base));
         return result;
     }

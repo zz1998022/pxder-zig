@@ -1,8 +1,28 @@
-//! 终端 UI 模块
-//! 提供 ANSI 颜色输出、进度条、日志打印等功能。
-//! 所有输出函数都需要传入 io 实例（Zig 0.16 的 I/O 模型要求）。
+//! 终端 UI 与日志模块
+//! 提供日志级别控制、ANSI 颜色输出、进度显示等功能。
 
 const std = @import("std");
+
+/// 日志级别
+pub const LogLevel = enum(u8) {
+    err = 0,
+    warn = 1,
+    info = 2,
+    debug = 3,
+};
+
+/// 全局日志级别（运行时可通过 setLogLevel 修改）
+var current_log_level: LogLevel = .info;
+
+/// 设置全局日志级别
+pub fn setLogLevel(level: LogLevel) void {
+    current_log_level = level;
+}
+
+/// 获取当前日志级别
+pub fn logLevel() LogLevel {
+    return current_log_level;
+}
 
 /// 支持的终端颜色
 pub const Color = enum {
@@ -13,8 +33,8 @@ pub const Color = enum {
     cyan,
     gray,
     white,
-    bg_red, // 背景色：用于下载失败标记
-    bg_yellow, // 背景色：用于重试标记
+    bg_red,
+    bg_yellow,
     bg_magenta,
 };
 
@@ -53,20 +73,42 @@ pub fn clearLine(io: std.Io) void {
     fw.flush() catch {};
 }
 
-/// 以红色输出错误信息到标准错误流
-/// 格式: ERROR: <message>
-pub fn logError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+/// DEBUG 级别日志（灰色前缀，仅当日志级别 >= debug 时输出）
+pub fn logDebug(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    if (@intFromEnum(current_log_level) < @intFromEnum(LogLevel.debug)) return;
     var buf: [4096]u8 = undefined;
     var fw = std.Io.File.stderr().writer(io, &buf);
-    fw.interface.writeAll(colorCode(.red)) catch {};
-    fw.interface.print("ERROR: ", .{}) catch {};
-    fw.interface.print(fmt, args) catch {};
+    fw.interface.writeAll(colorCode(.gray)) catch {};
+    fw.interface.print("[D] " ++ fmt, args) catch {};
     fw.interface.writeAll("\n") catch {};
     fw.interface.writeAll(colorCode(.reset)) catch {};
     fw.flush() catch {};
 }
 
-/// 输出普通信息到标准输出（带换行）
+/// WARN 级别日志（黄色前缀，仅当日志级别 >= warn 时输出）
+pub fn logWarn(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    if (@intFromEnum(current_log_level) < @intFromEnum(LogLevel.warn)) return;
+    var buf: [4096]u8 = undefined;
+    var fw = std.Io.File.stderr().writer(io, &buf);
+    fw.interface.writeAll(colorCode(.yellow)) catch {};
+    fw.interface.print("[W] " ++ fmt, args) catch {};
+    fw.interface.writeAll("\n") catch {};
+    fw.interface.writeAll(colorCode(.reset)) catch {};
+    fw.flush() catch {};
+}
+
+/// ERROR 级别日志（红色前缀，始终输出）
+pub fn logError(io: std.Io, comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var fw = std.Io.File.stderr().writer(io, &buf);
+    fw.interface.writeAll(colorCode(.red)) catch {};
+    fw.interface.print("[E] " ++ fmt, args) catch {};
+    fw.interface.writeAll("\n") catch {};
+    fw.interface.writeAll(colorCode(.reset)) catch {};
+    fw.flush() catch {};
+}
+
+/// INFO 级别日志（标准输出，无颜色前缀，仅当日志级别 >= info 时输出）
 pub fn logInfo(io: std.Io, comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var fw = std.Io.File.stdout().writer(io, &buf);

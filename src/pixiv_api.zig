@@ -18,6 +18,7 @@
 const std = @import("std");
 const http_client = @import("http_client.zig");
 const json_utils = @import("json_utils.zig");
+const terminal = @import("terminal.zig");
 const crypto = @import("crypto.zig");
 
 /// Pixiv Android 应用 OAuth 凭据
@@ -259,7 +260,7 @@ pub const PixivApi = struct {
 
     /// 通过 authorization code 交换 token（OAuth PKCE 流程的最后一步）
     pub fn exchangeToken(self: *PixivApi, code: []const u8, code_verifier: []const u8) !void {
-        std.log.debug("[exchangeToken] starting token exchange...", .{});
+        terminal.logDebug(self.io, "[exchangeToken] starting token exchange...", .{});
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
 
@@ -274,11 +275,11 @@ pub const PixivApi = struct {
             .{ "redirect_uri", "https://app-api.pixiv.net/web/v1/users/auth/pixiv/callback" },
         });
 
-        std.log.debug("[exchangeToken] POST {s} body={s}", .{ TOKEN_URL, body });
+        terminal.logDebug(self.io, "[exchangeToken] POST {s} body={s}", .{ TOKEN_URL, body });
         const resp = try self.http.post(TOKEN_URL, body, header_result.items);
         defer resp.deinit();
 
-        std.log.debug("[exchangeToken] status: {} body: {s}", .{ resp.status, resp.body });
+        terminal.logDebug(self.io, "[exchangeToken] status: {} body: {s}", .{ resp.status, resp.body });
 
         if (@intFromEnum(resp.status) != 200) return error.TokenExchangeFailed;
 

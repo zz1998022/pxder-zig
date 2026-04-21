@@ -12,9 +12,11 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 - 下载收藏插画（公开/私密）
 - 增量更新已下载的画师作品
 - 多线程并发下载（默认 5 线程，最大 32）
+- 下载进度实时显示（彩色线程级输出）
 - 自动重试与限流处理
 - 断点续传（跳过已下载文件）
-- HTTP/HTTPS CONNECT 代理
+- HTTP/HTTPS CONNECT 代理（手动 TLS 隧道）
+- 日志系统（`--debug` 启用详细输出）
 - OAuth PKCE 登录（模拟 Pixiv Android 客户端）
 - Windows `pixiv://` 协议自动回调
 - 跨平台：Windows / Linux / macOS
@@ -25,7 +27,7 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 |------|-----------------|-----------|
 | 运行时依赖 | Node.js >= 16 | 无（单二进制） |
 | 安装方式 | npm install -g | 下载对应平台的二进制文件 |
-| 代理支持 | HTTP / SOCKS5 | HTTP CONNECT（SOCKS5 计划中） |
+| 代理支持 | HTTP / SOCKS5 | HTTP CONNECT（手动 TLS 隧道） |
 | 直连模式 | 支持（已移除） | 不支持 |
 | Windows 协议回调 | 支持 | 支持 |
 | 配置存储 | 用户目录 | 用户目录 |
@@ -204,7 +206,7 @@ src/
 ## 技术细节
 
 - **HTTP/TLS**：基于 `std.http.Client` + `std.crypto.tls`，手动实现 HTTPS CONNECT 隧道以绕过 Zig 0.16 标准库的 TLS 升级缺陷
-- **并发模型**：`std.Thread.Pool` + `std.Thread.WaitGroup`，每个下载任务作为独立 job 提交
+- **并发模型**：每线程独立 HttpClient，避免共享状态竞争，通过原子索引实现工作窃取
 - **加密**：`std.crypto.hash.Md5`（API 签名）、`std.crypto.hash.sha2.Sha256`（PKCE）、base64url
 - **JSON**：`std.json` 动态树解析（`std.json.Value`），配合辅助函数安全提取字段
 - **依赖**：仅使用 Zig 标准库，无第三方依赖

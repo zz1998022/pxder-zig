@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const proxy = @import("proxy.zig");
+const terminal = @import("terminal.zig");
 
 /// HTTP 响应，包含状态码和响应体
 pub const HttpResponse = struct {
@@ -36,6 +37,7 @@ pub const HttpClient = struct {
     _proxy_config: ?proxy.ProxyConfig = null,
     /// 系统证书缓存（手动 CONNECT 隧道用）
     _ca_bundle_loaded: bool = false,
+
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, proxy_config: ?proxy.ProxyConfig) !HttpClient {
         var self: HttpClient = .{
@@ -240,22 +242,22 @@ pub const HttpClient = struct {
         const pc = self._proxy_config.?;
 
         // 确保证书已加载
-        std.log.debug("[tunnel] loading CA bundle...", .{});
+        terminal.logDebug(io, "[tunnel] loading CA bundle...", .{});
         try self.ensureCaBundle();
-        std.log.debug("[tunnel] CA bundle loaded", .{});
+        terminal.logDebug(io, "[tunnel] CA bundle loaded", .{});
 
         // 提取目标主机和端口
         var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
         const target_host = try uri.getHost(&host_buf);
         const target_port: u16 = uri.port orelse 443;
-        std.log.debug("[tunnel] target: {s}:{d}", .{ target_host.bytes, target_port });
+        terminal.logDebug(io, "[tunnel] target: {s}:{d}", .{ target_host.bytes, target_port });
 
         // 1. 连接代理
-        std.log.debug("[tunnel] connecting to proxy {s}:{d}...", .{ pc.host, pc.port });
+        terminal.logDebug(io, "[tunnel] connecting to proxy {s}:{d}...", .{ pc.host, pc.port });
         const proxy_host: std.Io.net.HostName = .{ .bytes = pc.host };
         var stream = try proxy_host.connect(io, pc.port, .{ .mode = .stream, .protocol = .tcp });
         errdefer stream.close(io);
-        std.log.debug("[tunnel] connected to proxy", .{});
+        terminal.logDebug(io, "[tunnel] connected to proxy", .{});
 
         // 2. 发送 CONNECT 请求
         {
@@ -275,7 +277,7 @@ pub const HttpClient = struct {
         }
 
         // 3. 读取 CONNECT 响应（读到 \r\n\r\n）
-        std.log.debug("[tunnel] CONNECT sent, reading response...", .{});
+        terminal.logDebug(io, "[tunnel] CONNECT sent, reading response...", .{});
         {
             var read_buf: [4096]u8 = undefined;
             var r = stream.reader(io, &read_buf);
@@ -300,11 +302,11 @@ pub const HttpClient = struct {
             const status_start = std.mem.indexOfScalar(u8, resp, ' ') orelse return error.ProxyConnectFailed;
             const status_str = resp[status_start + 1 ..][0..3];
             if (!std.mem.eql(u8, status_str, "200")) return error.ProxyConnectFailed;
-            std.log.debug("[tunnel] CONNECT response: {s}", .{resp});
+            terminal.logDebug(io, "[tunnel] CONNECT response: {s}", .{resp});
         }
 
         // 4. TLS 握手
-        std.log.debug("[tunnel] starting TLS handshake...", .{});
+        terminal.logDebug(io, "[tunnel] starting TLS handshake...", .{});
         const tls_read_buf_len = self.client.tls_buffer_size + self.client.read_buffer_size;
         const tls_alloc_size = tls_read_buf_len + self.client.tls_buffer_size +
             self.client.write_buffer_size + self.client.tls_buffer_size;
@@ -343,7 +345,7 @@ pub const HttpClient = struct {
                 .allow_truncation_attacks = true,
             },
         ) catch return error.TlsInitializationFailed;
-        std.log.debug("[tunnel] TLS handshake completed", .{});
+        terminal.logDebug(io, "[tunnel] TLS handshake completed", .{});
         const method_str = switch (method) {
             .GET => "GET",
             .POST => "POST",
@@ -375,10 +377,10 @@ pub const HttpClient = struct {
             }
             req_writer.writeAll("Connection: close\r\n\r\n") catch return error.InvalidRequest;
             const req_data = req_writer.buffered();
-            std.log.debug("[tunnel] sending HTTP request ({} bytes)...", .{req_data.len});
+            terminal.logDebug(io, "[tunnel] sending HTTP request ({} bytes)...", .{req_data.len});
             tls_client.writer.writeAll(req_data) catch return error.TlsWriteFailed;
         }
-        std.log.debug("[tunnel] HTTP request sent", .{});
+        terminal.logDebug(io, "[tunnel] HTTP request sent", .{});
 
         // 发送 body
         if (body) |b| {
@@ -391,14 +393,14 @@ pub const HttpClient = struct {
         // 6. 读取 HTTP 响应
         // TLS Client 的 readIndirect 将解密数据放入 reader 内部 buffer，
         // 并返回 0（不是实际字节数）。需要用 peekGreedy/take 来触发 fill 再取数据。
-        std.log.debug("[tunnel] reading HTTP response...", .{});
+        terminal.logDebug(io, "[tunnel] reading HTTP response...", .{});
         var resp_data: std.ArrayListUnmanaged(u8) = .empty;
         errdefer resp_data.deinit(allocator);
         var read_chunks: usize = 0;
         while (true) {
             // peekGreedy(1) 触发一次 readVec -> readIndirect，返回所有已缓冲数据
             const available = tls_client.reader.peekGreedy(1) catch |err| {
-                std.log.debug("[tunnel] peek error: {}", .{err});
+                terminal.logDebug(io, "[tunnel] peek error: {}", .{err});
                 break;
             };
             if (available.len == 0) break;
@@ -406,7 +408,7 @@ pub const HttpClient = struct {
             try resp_data.appendSlice(allocator, available);
             tls_client.reader.toss(available.len);
         }
-        std.log.debug("[tunnel] read {} chunks, {} bytes total", .{ read_chunks, resp_data.items.len });
+        terminal.logDebug(io, "[tunnel] read {} chunks, {} bytes total", .{ read_chunks, resp_data.items.len });
 
         // 7. 解析响应
         if (resp_data.items.len == 0) return error.InvalidResponse;

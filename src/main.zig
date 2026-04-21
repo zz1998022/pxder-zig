@@ -198,6 +198,10 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
+    if (cli.debug) {
+        terminal.setLogLevel(.debug);
+    }
+
     if (cli.action == null) {
         printHelp(io);
         return;
@@ -564,7 +568,7 @@ fn doDownloadUid(init: std.process.Init, cli: CliArgs) !void {
 
     terminal.logInfo(io, "共 {d} 位画师待下载", .{illustrators.items.len});
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http);
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, resolveProxy(&ctx.cfg, ctx.environ_map));
     try dl.downloadByIllustrators(illustrators.items, &ctx.api);
 
     terminal.printColored(io, .green, "下载完成。", .{});
@@ -613,7 +617,7 @@ fn doDownloadPid(init: std.process.Init, cli: CliArgs) !void {
         return;
     }
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http);
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, resolveProxy(&ctx.cfg, ctx.environ_map));
 
     for (pids.items) |pid| {
         terminal.logInfo(io, "处理插画 {d}...", .{pid});
@@ -756,7 +760,7 @@ fn doDownloadFollow(init: std.process.Init, cli: CliArgs, is_private: bool) !voi
         try illustrators_list.append(allocator, artist);
     }
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http);
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, resolveProxy(&ctx.cfg, ctx.environ_map));
     try dl.downloadByIllustrators(illustrators_list.items, &ctx.api);
 
     terminal.printColored(io, .green, "关注画师下载完成。", .{});
@@ -787,7 +791,7 @@ fn doDownloadBookmark(init: std.process.Init, cli: CliArgs, is_private: bool) !v
     var me = illustrator.Illustrator.init(allocator, my_id);
     defer me.deinit();
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http);
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, resolveProxy(&ctx.cfg, ctx.environ_map));
 
     if (is_private) {
         terminal.logInfo(io, "开始下载私密收藏...", .{});
@@ -859,7 +863,7 @@ fn doDownloadUpdate(init: std.process.Init, cli: CliArgs) !void {
 
     terminal.logInfo(io, "发现 {d} 位画师，开始更新下载...", .{illustrators.items.len});
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http);
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, resolveProxy(&ctx.cfg, ctx.environ_map));
     try dl.downloadByIllustrators(illustrators.items, &ctx.api);
 
     terminal.printColored(io, .green, "更新下载完成。", .{});

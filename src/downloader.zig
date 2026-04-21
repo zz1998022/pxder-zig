@@ -37,15 +37,15 @@ const REFERER = "https://www.pixiv.net/";
 
 /// 下载任务共享状态（线程安全）
 pub const DownloadState = struct {
-    mutex: std.atomic.Mutex = .unlocked, // 保护共享数据的互斥锁
-    next_index: std.atomic.Value(usize), // 下一个待下载任务的索引（工作窃取模式）
-    total_count: usize, // 总任务数
-    error_count: std.atomic.Value(u32), // 当前出错线程数（原子操作）
-    is_paused: std.atomic.Value(bool), // 全局暂停标志（多个线程出错时触发）
-    success_count: std.atomic.Value(u32), // 成功下载数
-    skip_count: std.atomic.Value(u32), // 跳过数（404 等）
+    mutex: std.atomic.Mutex = .unlocked,
+    next_index: std.atomic.Value(usize),
+    total_count: usize,
+    error_count: std.atomic.Value(u32),
+    is_paused: std.atomic.Value(bool),
+    success_count: std.atomic.Value(u32),
+    skip_count: std.atomic.Value(u32),
+    completed_count: std.atomic.Value(u32),
 
-    /// 初始化下载状态
     pub fn init(total: usize) DownloadState {
         return .{
             .next_index = std.atomic.Value(usize).init(0),
@@ -54,6 +54,7 @@ pub const DownloadState = struct {
             .is_paused = std.atomic.Value(bool).init(false),
             .success_count = std.atomic.Value(u32).init(0),
             .skip_count = std.atomic.Value(u32).init(0),
+            .completed_count = std.atomic.Value(u32).init(0),
         };
     }
 };
@@ -62,11 +63,12 @@ pub const DownloadState = struct {
 const WorkerContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    http: *http_client.HttpClient,
+    proxy_config: ?@import("proxy.zig").ProxyConfig,
     state: *DownloadState,
     illusts: []const illust.Illust,
     temp_dir: []const u8,
     final_dir: []const u8,
+    thread_id: u32,
 };
 
 /// 下载管理器
@@ -75,14 +77,16 @@ pub const Downloader = struct {
     io: std.Io,
     config: config.DownloadConfig,
     http: *http_client.HttpClient,
+    proxy_config: ?@import("proxy.zig").ProxyConfig,
 
     /// 初始化下载管理器
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.DownloadConfig, http: *http_client.HttpClient) Downloader {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, cfg: config.DownloadConfig, http: *http_client.HttpClient, proxy_cfg: ?@import("proxy.zig").ProxyConfig) Downloader {
         return .{
             .allocator = allocator,
             .io = io,
             .config = cfg,
             .http = http,
+            .proxy_config = proxy_cfg,
         };
     }
 
@@ -112,16 +116,22 @@ pub const Downloader = struct {
         // 初始化共享状态
         var state = DownloadState.init(illusts_list.len);
 
-        // 构造工作线程上下文
-        var ctx = WorkerContext{
-            .allocator = self.allocator,
-            .io = self.io,
-            .http = self.http,
-            .state = &state,
-            .illusts = illusts_list,
-            .temp_dir = temp_dir,
-            .final_dir = dir,
-        };
+        // 为每个线程创建独立的上下文
+        var contexts = try self.allocator.alloc(WorkerContext, thread_count);
+        defer self.allocator.free(contexts);
+
+        for (0..thread_count) |tid| {
+            contexts[tid] = .{
+                .allocator = self.allocator,
+                .io = self.io,
+                .proxy_config = self.proxy_config,
+                .state = &state,
+                .illusts = illusts_list,
+                .temp_dir = temp_dir,
+                .final_dir = dir,
+                .thread_id = @intCast(tid),
+            };
+        }
 
         terminal.logInfo(self.io, "开始下载 {d} 个文件，使用 {d} 个线程...", .{ illusts_list.len, thread_count });
 
@@ -129,8 +139,8 @@ pub const Downloader = struct {
         var threads = std.ArrayListUnmanaged(std.Thread).empty;
         defer threads.deinit(self.allocator);
 
-        for (0..thread_count) |_| {
-            const handle = std.Thread.spawn(.{}, workerFunc, .{&ctx}) catch continue;
+        for (0..thread_count) |tid| {
+            const handle = std.Thread.spawn(.{}, workerFunc, .{&contexts[tid]}) catch continue;
             threads.append(self.allocator, handle) catch {
                 handle.join();
                 continue;
@@ -355,96 +365,85 @@ pub const Downloader = struct {
 /// 下载成功或 404 跳过后继续下一个任务
 /// 重试耗尽时递增错误计数，可能触发全局暂停
 fn workerFunc(ctx: *WorkerContext) void {
+    var http = http_client.HttpClient.init(ctx.allocator, ctx.io, ctx.proxy_config) catch return;
+    defer http.deinit();
+
     const referer_header = std.http.Header{ .name = "referer", .value = REFERER };
+    const total = ctx.state.total_count;
 
     while (true) {
-        // 检查全局暂停标志
         if (ctx.state.is_paused.load(.acquire)) {
             std.Io.sleep(ctx.io, .fromSeconds(300), .real) catch {};
             ctx.state.is_paused.store(false, .release);
             continue;
         }
 
-        // 原子获取下一个任务索引
         const i = ctx.state.next_index.fetchAdd(1, .monotonic);
         if (i >= ctx.state.total_count) break;
 
         const item = ctx.illusts[i];
 
-        // 检查最终文件是否已存在（跳过已下载的文件）
         const final_path = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.final_dir, item.file }) catch continue;
         defer ctx.allocator.free(final_path);
 
+        // 跳过已存在的文件
         if (fileExists(ctx.io, final_path)) {
             _ = ctx.state.skip_count.fetchAdd(1, .monotonic);
+            const done = ctx.state.completed_count.fetchAdd(1, .monotonic) + 1;
+            printProgress(ctx.io, ctx.thread_id, done, total, item.id, item.title, "exists");
             continue;
         }
 
-        // 构造临时文件路径
         const temp_path = std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.temp_dir, item.file }) catch continue;
         defer ctx.allocator.free(temp_path);
 
-        // 重试下载
         var retry: u32 = 0;
         var download_ok = false;
         var is_404 = false;
 
         while (retry <= MAX_RETRY) : (retry += 1) {
-            // 检查全局暂停（重试前）
             if (ctx.state.is_paused.load(.acquire)) {
                 std.Io.sleep(ctx.io, .fromSeconds(300), .real) catch {};
                 ctx.state.is_paused.store(false, .release);
                 continue;
             }
 
-            // 发起 HTTP GET 请求下载文件
-            const resp = ctx.http.get(item.url, &.{referer_header}) catch {
-                // 网络错误，等待后重试
+            const resp = http.get(item.url, &.{referer_header}) catch {
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             };
             defer resp.deinit();
 
-            // 检查 HTTP 状态码
             const status_code = @intFromEnum(resp.status);
 
             if (status_code == 404) {
-                // 404 立即跳过，不重试
                 is_404 = true;
-                terminal.logError(ctx.io, "404 未找到: {s}", .{item.file});
                 break;
             }
 
             if (status_code < 200 or status_code >= 300) {
-                // 非 2xx 响应，重试
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             }
 
-            // 检查响应体是否为空
             if (resp.body.len == 0) {
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             }
 
-            // 将响应体写入临时文件
             writeFile(ctx.io, temp_path, resp.body) catch {
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             };
 
-            // 校验文件大小（读取刚写入的文件大小确认写入成功）
             const written_size = getFileSize(ctx.io, temp_path) catch 0;
             if (written_size != resp.body.len) {
-                // 大小不匹配，删除临时文件并重试
                 deleteFile(ctx.io, temp_path);
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
             }
 
-            // 将临时文件移动到最终目录
             moveFile(ctx.io, temp_path, final_path) catch {
-                // 移动失败，删除临时文件后重试
                 deleteFile(ctx.io, temp_path);
                 std.Io.sleep(ctx.io, .fromSeconds(1), .real) catch {};
                 continue;
@@ -456,22 +455,42 @@ fn workerFunc(ctx: *WorkerContext) void {
 
         if (download_ok) {
             _ = ctx.state.success_count.fetchAdd(1, .monotonic);
+            const done = ctx.state.completed_count.fetchAdd(1, .monotonic) + 1;
+            printProgress(ctx.io, ctx.thread_id, done, total, item.id, item.title, "OK");
         } else if (is_404) {
             _ = ctx.state.skip_count.fetchAdd(1, .monotonic);
+            const done = ctx.state.completed_count.fetchAdd(1, .monotonic) + 1;
+            printProgress(ctx.io, ctx.thread_id, done, total, item.id, item.title, "404");
         } else {
-            // 重试耗尽
             _ = ctx.state.error_count.fetchAdd(1, .monotonic);
-            terminal.logError(ctx.io, "下载失败（重试 {d} 次）: {s}", .{ retry, item.file });
+            const done = ctx.state.completed_count.fetchAdd(1, .monotonic) + 1;
+            printProgress(ctx.io, ctx.thread_id, done, total, item.id, item.title, "FAIL");
 
-            // 超过 1 个线程出错时触发全局暂停
             if (ctx.state.error_count.load(.monotonic) > 1) {
                 ctx.state.is_paused.store(true, .release);
             }
 
-            // 清理可能残留的临时文件
             deleteFile(ctx.io, temp_path);
         }
     }
+}
+
+fn printProgress(io: std.Io, thread_id: u32, done: u32, total: usize, pid: u64, title: []const u8, status: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var fw = std.Io.File.stdout().writer(io, &buf);
+    if (std.mem.eql(u8, status, "OK")) {
+        fw.interface.writeAll(terminal.colorCode(.green)) catch {};
+    } else if (std.mem.eql(u8, status, "FAIL")) {
+        fw.interface.writeAll(terminal.colorCode(.red)) catch {};
+    } else if (std.mem.eql(u8, status, "404")) {
+        fw.interface.writeAll(terminal.colorCode(.yellow)) catch {};
+    } else {
+        fw.interface.writeAll(terminal.colorCode(.gray)) catch {};
+    }
+    fw.interface.print("[{d}] {d}/{d}  pid {d}  {s}  {s}", .{ thread_id, done, total, pid, title, status }) catch {};
+    fw.interface.writeAll(terminal.colorCode(.reset)) catch {};
+    fw.interface.writeAll("\n") catch {};
+    fw.flush() catch {};
 }
 
 // ==================== 文件系统辅助函数 ====================
