@@ -74,6 +74,44 @@ zig build run -- --help
 
 `zig build bench` 会运行一组本地 synthetic benchmark，主要覆盖本项目已经优化过的热点 JSON 解析与下载任务生成路径，方便在后续改动时做回归对比。
 
+## 自动发版
+
+仓库内置了两条 GitHub Actions 工作流：
+
+- [release.yml](.github/workflows/release.yml)：当推送 `v*` 标签时，自动校验版本号、下载 Zig 0.16.0、运行测试、构建 Windows x64 版本，并创建或更新 GitHub Release。
+- [winget.yml](.github/workflows/winget.yml)：当 GitHub Release 发布后，自动读取对应的 Windows 可执行文件资产，并调用 `wingetcreate update --submit` 向 `winget-pkgs` 提交更新 PR。
+
+### Release 触发方式
+
+发布前先把 [src/cli/args.zig](src/cli/args.zig) 里的版本号改成目标版本，例如 `2.12.11`，然后执行：
+
+```bash
+git tag v2.12.11
+git push origin main --tags
+```
+
+工作流会生成两个固定命名的资产：
+
+- `pxder-v2.12.11-windows-x64.exe`
+- `pxder-v2.12.11-windows-x64.zip`
+
+其中 `.exe` 资产会作为 WinGet 更新源使用。
+
+### 启用 WinGet 自动更新
+
+在 GitHub 仓库里配置以下项目：
+
+- Repository variable: `WINGET_PACKAGE_IDENTIFIER`
+  例如：`zz1998022.pxder`
+- Repository secret: `WINGET_CREATE_GITHUB_TOKEN`
+  这是一个 GitHub Personal Access Token（classic），至少需要 `public_repo` 权限，用于向 `microsoft/winget-pkgs` 自动提交 PR。
+
+### 首次接入说明
+
+当前自动化流程默认使用 `wingetcreate update --submit`，适合 **已经被 winget 收录过** 的包。
+
+如果 `pxder` 还没有首次进入 `winget-pkgs`，建议先手动完成一次初始 manifest 提交；等首个包被合并后，后续版本就可以完全交给这套 Action 自动更新。
+
 ## 使用方法
 
 ### 登录

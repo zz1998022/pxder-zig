@@ -1,0 +1,73 @@
+name: Update WinGet Manifest
+
+on:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: read
+
+jobs:
+  submit-winget:
+    name: Submit WinGet Update
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: windows-latest
+    steps:
+      - name: Setup .NET runtime for wingetcreate
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Validate winget automation configuration
+        shell: pwsh
+        env:
+          PACKAGE_IDENTIFIER: ${{ vars.WINGET_PACKAGE_IDENTIFIER }}
+          WINGET_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PACKAGE_IDENTIFIER)) {
+            throw "缺少仓库变量 WINGET_PACKAGE_IDENTIFIER"
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_TOKEN)) {
+            throw "缺少仓库机密 WINGET_CREATE_GITHUB_TOKEN"
+          }
+
+      - name: Download wingetcreate
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://aka.ms/wingetcreate/latest" -OutFile "wingetcreate.exe"
+
+      - name: Resolve release asset URL
+        id: release
+        shell: pwsh
+        run: |
+          $event = Get-Content $env:GITHUB_EVENT_PATH -Raw | ConvertFrom-Json
+          $tagName = $event.release.tag_name
+          if (-not $tagName.StartsWith("v")) {
+            throw "发布标签必须以 v 开头，例如 v2.12.10"
+          }
+
+          $appVersion = $tagName.Substring(1)
+          $expectedAssetName = "pxder-v$appVersion-windows-x64.exe"
+          $asset = $event.release.assets | Where-Object { $_.name -eq $expectedAssetName } | Select-Object -First 1
+
+          if (-not $asset) {
+            throw "未在 Release 中找到资产 $expectedAssetName"
+          }
+
+          "app_version=$appVersion" >> $env:GITHUB_OUTPUT
+          "asset_url=$($asset.browser_download_url)" >> $env:GITHUB_OUTPUT
+
+      - name: Submit manifest update to winget-pkgs
+        shell: pwsh
+        env:
+          PACKAGE_IDENTIFIER: ${{ vars.WINGET_PACKAGE_IDENTIFIER }}
+          WINGET_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          # 首次收录建议先手动提交一个初始 manifest。
+          # 后续版本更新由这里自动调用 wingetcreate update --submit。
+          .\wingetcreate.exe update $env:PACKAGE_IDENTIFIER `
+            -u "${{ steps.release.outputs.asset_url }}" `
+            -v "${{ steps.release.outputs.app_version }}" `
+            -t $env:WINGET_TOKEN `
+            --submit

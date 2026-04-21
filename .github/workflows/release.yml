@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows-release:
+    name: Build Windows Release
+    runs-on: windows-latest
+    env:
+      ZIG_VERSION: 0.16.0
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $tagName = "${{ github.ref_name }}"
+          if (-not $tagName.StartsWith("v")) {
+            throw "标签必须以 v 开头，例如 v2.12.10"
+          }
+
+          $appVersion = $tagName.Substring(1)
+          $argsFile = Get-Content "src/cli/args.zig" -Raw
+          $match = [regex]::Match($argsFile, 'pub const version = "([^"]+)"')
+          if (-not $match.Success) {
+            throw "无法从 src/cli/args.zig 读取版本号"
+          }
+
+          $codeVersion = $match.Groups[1].Value
+          if ($codeVersion -ne $appVersion) {
+            throw "代码版本 $codeVersion 与标签版本 $appVersion 不一致"
+          }
+
+          $assetBase = "pxder-v$appVersion-windows-x64"
+          "app_version=$appVersion" >> $env:GITHUB_OUTPUT
+          "asset_base=$assetBase" >> $env:GITHUB_OUTPUT
+
+      - name: Install Zig
+        shell: pwsh
+        run: |
+          $zigVersion = $env:ZIG_VERSION
+          $zigZip = "zig-x86_64-windows-$zigVersion.zip"
+          $zigUrl = "https://ziglang.org/download/$zigVersion/$zigZip"
+          $zigRoot = Join-Path $env:RUNNER_TEMP "zig"
+          $zigExtract = Join-Path $zigRoot "extract"
+
+          New-Item -ItemType Directory -Force -Path $zigRoot | Out-Null
+          Invoke-WebRequest $zigUrl -OutFile (Join-Path $zigRoot $zigZip)
+          Expand-Archive -Path (Join-Path $zigRoot $zigZip) -DestinationPath $zigExtract -Force
+
+          $zigDir = Get-ChildItem -Path $zigExtract -Directory | Select-Object -First 1
+          if (-not $zigDir) {
+            throw "Zig 解压失败"
+          }
+
+          $zigDir.FullName >> $env:GITHUB_PATH
+
+      - name: Show Zig version
+        shell: pwsh
+        run: zig version
+
+      - name: Run tests
+        shell: pwsh
+        run: zig build test -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+
+      - name: Build release binary
+        shell: pwsh
+        run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+
+      - name: Package release assets
+        id: package
+        shell: pwsh
+        run: |
+          $assetBase = "${{ steps.meta.outputs.asset_base }}"
+          $distRoot = Join-Path $env:RUNNER_TEMP "release-assets"
+          $portableRoot = Join-Path $distRoot $assetBase
+          $exeSource = "zig-out/bin/pxder.exe"
+
+          if (-not (Test-Path $exeSource)) {
+            throw "未找到构建产物 $exeSource"
+          }
+
+          New-Item -ItemType Directory -Force -Path $portableRoot | Out-Null
+
+          $exeAsset = Join-Path $distRoot "$assetBase.exe"
+          Copy-Item $exeSource $exeAsset
+
+          Copy-Item $exeSource (Join-Path $portableRoot "pxder.exe")
+          Copy-Item "README.md" (Join-Path $portableRoot "README.md")
+          Copy-Item "LICENSE" (Join-Path $portableRoot "LICENSE")
+
+          $zipAsset = Join-Path $distRoot "$assetBase.zip"
+          if (Test-Path $zipAsset) {
+            Remove-Item $zipAsset -Force
+          }
+          Compress-Archive -Path (Join-Path $portableRoot "*") -DestinationPath $zipAsset
+
+          "exe_asset=$exeAsset" >> $env:GITHUB_OUTPUT
+          "zip_asset=$zipAsset" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tagName = "${{ github.ref_name }}"
+          $appVersion = "${{ steps.meta.outputs.app_version }}"
+          $exeAsset = "${{ steps.package.outputs.exe_asset }}"
+          $zipAsset = "${{ steps.package.outputs.zip_asset }}"
+
+          gh release view $tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tagName $exeAsset $zipAsset --clobber
+          } else {
+            gh release create $tagName $exeAsset $zipAsset `
+              --title "pxder $appVersion" `
+              --generate-notes
+          }
