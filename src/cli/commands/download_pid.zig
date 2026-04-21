@@ -1,8 +1,6 @@
 const std = @import("std");
 const terminal = @import("../../shared/terminal.zig");
 const tools = @import("../../shared/tools.zig");
-const illust_mod = @import("../../core/illust.zig");
-const json_utils = @import("../../shared/json_utils.zig");
 const downloader = @import("../../services/download_service.zig");
 const cli_args = @import("../args.zig");
 const app_context = @import("../../app/context.zig");
@@ -19,6 +17,7 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
         ctx.cfg.download.path = try allocator.dupe(u8, od);
         tools.ensureDir(io, od);
     }
+    ctx.cfg.download.no_ugoira_meta = cli.no_ugoira_meta;
 
     const base_dir = ctx.cfg.download.path orelse {
         terminal.logError(io, "未设置下载目录", .{});
@@ -50,53 +49,8 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
         return;
     }
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
-
-    for (pids.items) |pid| {
-        terminal.logInfo(io, "处理插画 {d}...", .{pid});
-
-        // Fetch illust detail
-        const parsed = ctx.api.illustDetail(pid) catch |err| {
-            terminal.logError(io, "获取插画 {d} 详情失败: {}", .{ pid, err });
-            continue;
-        };
-        defer parsed.deinit();
-
-        const json = parsed.value;
-        const illust_json = json_utils.getFieldObject(json, "illust") orelse blk: {
-            // Some API versions return the illust directly at top level
-            if (json == .object and json.object.get("id") != null) {
-                break :blk json.object;
-            }
-            break :blk null;
-        } orelse {
-            terminal.logError(io, "解析插画 {d} 数据失败", .{pid});
-            continue;
-        };
-
-        const illust_json_val = std.json.Value{ .object = illust_json };
-        const illusts = illust_mod.parseIllusts(allocator, illust_json_val, null) catch |err| {
-            terminal.logError(io, "解析插画 {d} 失败: {}", .{ pid, err });
-            continue;
-        };
-        defer illust_mod.deinitIllusts(allocator, illusts);
-
-        if (illusts.len == 0) {
-            terminal.logInfo(io, "插画 {d} 无可下载内容", .{pid});
-            continue;
-        }
-
-        // Download to <download_path>/<pid>/
-        const pid_dir = try std.fmt.allocPrint(allocator, "{s}/{d}", .{ base_dir, pid });
-        defer allocator.free(pid_dir);
-        tools.ensureDir(io, pid_dir);
-
-        terminal.logInfo(io, "下载插画 {d} ({d} 个文件) 到: {s}", .{ pid, illusts.len, pid_dir });
-
-        dl.downloadIllusts(illusts, pid_dir) catch |err| {
-            terminal.logError(io, "下载插画 {d} 失败: {}", .{ pid, err });
-        };
-    }
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
+    try dl.downloadByPids(&ctx.api, pids.items, base_dir);
 
     terminal.printColored(io, .green, "下载完成。", .{});
 }

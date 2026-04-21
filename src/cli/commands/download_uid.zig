@@ -18,6 +18,7 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
         ctx.cfg.download.path = try allocator.dupe(u8, od);
         tools.ensureDir(io, od);
     }
+    ctx.cfg.download.no_ugoira_meta = cli.no_ugoira_meta;
 
     const uids_str = cli.uids orelse {
         terminal.logError(io, "未指定画师 UID", .{});
@@ -54,7 +55,7 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
 
     terminal.logInfo(io, "共 {d} 位画师待下载", .{illustrators.items.len});
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
     try dl.downloadByIllustrators(illustrators.items, &ctx.api);
 
     terminal.printColored(io, .green, "下载完成。", .{});

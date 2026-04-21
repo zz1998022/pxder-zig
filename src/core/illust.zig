@@ -23,18 +23,43 @@ pub const IllustType = enum {
 /// 插画数据结构，表示一个待下载的文件
 pub const Illust = struct {
     id: u64, // 插画 PID
-    title: []const u8, // 清洗后的标题
     url: []const u8, // 下载 URL（原图或 ZIP）
     file: []const u8, // 本地文件名
     illust_type: IllustType, // 插画类型
 
     /// 释放所有分配的字符串字段
     pub fn deinit(self: *const Illust, allocator: std.mem.Allocator) void {
-        allocator.free(self.title);
         allocator.free(self.url);
         allocator.free(self.file);
     }
 };
+
+/// 轻量插画结构，只保留下载阶段真正需要的字段。
+/// 配合定向 JSON 解析使用，避免先构建动态 Value 树。
+pub const IllustImageUrlsLite = struct {
+    original: ?[]const u8 = null,
+};
+
+pub const IllustMetaPageLite = struct {
+    image_urls: ?IllustImageUrlsLite = null,
+};
+
+pub const IllustSinglePageLite = struct {
+    original_image_url: ?[]const u8 = null,
+};
+
+pub const IllustEntryLite = struct {
+    id: u64,
+    title: []const u8 = "",
+    meta_single_page: ?IllustSinglePageLite = null,
+    meta_pages: []IllustMetaPageLite = &.{},
+};
+
+/// 轻量结构里不再依赖 `type` 字段，直接根据原始 URL 模式判断是否为 ugoira。
+pub fn isUgoiraLite(item: IllustEntryLite) bool {
+    const original_url = if (item.meta_single_page) |meta| meta.original_image_url orelse return false else return false;
+    return std.mem.indexOf(u8, original_url, "_ugoira") != null;
+}
 
 /// 清洗插画标题，去除文件名中的非法字符
 /// 移除: 控制字符 (0x00-0x1F, 0x7F) 和文件名不安全字符 / \ : * ? " < > | . & $
@@ -152,11 +177,11 @@ pub fn parseIllusts(allocator: std.mem.Allocator, json: std.json.Value, ugoira_d
 
         try result.append(allocator, .{
             .id = @intCast(id),
-            .title = clean_title,
             .url = zip_url,
             .file = file_name,
             .illust_type = .ugoira,
         });
+        allocator.free(clean_title);
     } else if (meta_pages_val) |pages| {
         if (pages.items.len > 0) {
             // === 多图 ===
@@ -168,13 +193,11 @@ pub fn parseIllusts(allocator: std.mem.Allocator, json: std.json.Value, ugoira_d
                 if (original != .string) continue;
 
                 const ext = extractExtension(original.string);
-                const page_title = try allocator.dupe(u8, clean_title);
                 const file_name = try std.fmt.allocPrint(allocator, "({d}){s}_p{d}{s}", .{ id, clean_title, page_idx, ext });
                 const url_copy = try allocator.dupe(u8, original.string);
 
                 try result.append(allocator, .{
                     .id = @intCast(id),
-                    .title = page_title,
                     .url = url_copy,
                     .file = file_name,
                     .illust_type = .multi,
@@ -196,6 +219,84 @@ pub fn parseIllusts(allocator: std.mem.Allocator, json: std.json.Value, ugoira_d
     return result.toOwnedSlice(allocator);
 }
 
+/// 从轻量结构解析下载任务，避免热路径上额外构建动态 JSON 对象树。
+pub fn parseIllustLite(allocator: std.mem.Allocator, item: IllustEntryLite, ugoira_delay: ?u32) ![]Illust {
+    var result: std.ArrayListUnmanaged(Illust) = .empty;
+    errdefer {
+        for (result.items) |illust_item| illust_item.deinit(allocator);
+        result.deinit(allocator);
+    }
+
+    const clean_title = try sanitizeTitle(allocator, item.title);
+
+    if (isUgoiraLite(item)) {
+        const original_url = if (item.meta_single_page) |meta| meta.original_image_url orelse "" else "";
+        if (original_url.len == 0) {
+            allocator.free(clean_title);
+            return error.InvalidIllustJson;
+        }
+
+        const zip_url = try ugoiraZipUrl(allocator, original_url);
+        const file_name = if (ugoira_delay) |delay|
+            try std.fmt.allocPrint(allocator, "({d}){s}@{d}ms.zip", .{ item.id, clean_title, delay })
+        else
+            try std.fmt.allocPrint(allocator, "({d}){s}.zip", .{ item.id, clean_title });
+
+        try result.append(allocator, .{
+            .id = item.id,
+            .url = zip_url,
+            .file = file_name,
+            .illust_type = .ugoira,
+        });
+        allocator.free(clean_title);
+        return result.toOwnedSlice(allocator);
+    }
+
+    if (item.meta_pages.len > 0) {
+        for (item.meta_pages, 0..) |page, page_idx| {
+            const image_urls = page.image_urls orelse continue;
+            const original = image_urls.original orelse continue;
+
+            const ext = extractExtension(original);
+            const file_name = try std.fmt.allocPrint(allocator, "({d}){s}_p{d}{s}", .{
+                item.id,
+                clean_title,
+                page_idx,
+                ext,
+            });
+            const url_copy = try allocator.dupe(u8, original);
+
+            try result.append(allocator, .{
+                .id = item.id,
+                .url = url_copy,
+                .file = file_name,
+                .illust_type = .multi,
+            });
+        }
+        allocator.free(clean_title);
+        return result.toOwnedSlice(allocator);
+    }
+
+    const original_url = if (item.meta_single_page) |meta| meta.original_image_url orelse "" else "";
+    if (original_url.len == 0) {
+        allocator.free(clean_title);
+        return result.toOwnedSlice(allocator);
+    }
+
+    const ext = extractExtension(original_url);
+    const url_copy = try allocator.dupe(u8, original_url);
+    const file_name = try std.fmt.allocPrint(allocator, "({d}){s}{s}", .{ item.id, clean_title, ext });
+    try result.append(allocator, .{
+        .id = item.id,
+        .url = url_copy,
+        .file = file_name,
+        .illust_type = .single,
+    });
+    allocator.free(clean_title);
+
+    return result.toOwnedSlice(allocator);
+}
+
 /// 解析单张图片
 fn parseSingleImage(allocator: std.mem.Allocator, id: i64, clean_title: []const u8, meta_single: ?std.json.ObjectMap, result: *std.ArrayListUnmanaged(Illust)) !void {
     const original_url: []const u8 = blk: {
@@ -210,13 +311,11 @@ fn parseSingleImage(allocator: std.mem.Allocator, id: i64, clean_title: []const 
     if (original_url.len == 0) return;
 
     const ext = extractExtension(original_url);
-    const title_copy = try allocator.dupe(u8, clean_title);
     const url_copy = try allocator.dupe(u8, original_url);
     const file_name = try std.fmt.allocPrint(allocator, "({d}){s}{s}", .{ id, clean_title, ext });
 
     try result.append(allocator, .{
         .id = @intCast(id),
-        .title = title_copy,
         .url = url_copy,
         .file = file_name,
         .illust_type = .single,
@@ -275,7 +374,6 @@ test "parseIllusts parses single image" {
 
     try std.testing.expectEqual(@as(usize, 1), illusts.len);
     try std.testing.expectEqual(@as(u64, 12345), illusts[0].id);
-    try std.testing.expectEqualStrings("Test Image", illusts[0].title);
     try std.testing.expectEqual(IllustType.single, illusts[0].illust_type);
     try std.testing.expect(std.mem.endsWith(u8, illusts[0].file, ".jpg"));
     try std.testing.expect(std.mem.startsWith(u8, illusts[0].file, "(12345)Test Image"));

@@ -20,6 +20,7 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
         ctx.cfg.download.path = try allocator.dupe(u8, od);
         tools.ensureDir(io, od);
     }
+    ctx.cfg.download.no_ugoira_meta = cli.no_ugoira_meta;
 
     // Get current user ID by parsing the JWT access token
     const my_id = app_context.getMyUserId(&ctx.api) catch |err| {
@@ -33,7 +34,7 @@ pub fn run(init: std.process.Init, cli: cli_args.CliArgs) !void {
     var me = illustrator.Illustrator.init(allocator, my_id);
     defer me.deinit();
 
-    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, &ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
+    var dl = downloader.Downloader.init(allocator, io, ctx.cfg.download, ctx.http, app_context.resolveProxy(&ctx.cfg, ctx.environ_map));
 
     if (is_private) {
         terminal.logInfo(io, "开始下载私密收藏...", .{});

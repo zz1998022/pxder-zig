@@ -4,6 +4,8 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 
 单二进制分发，无运行时依赖，原生性能，支持交叉编译。
 
+当前版本基于 `Zig 0.16.0` 开发，核心下载链路已经完成一轮面向吞吐量的重构。
+
 ## 功能
 
 - 按画师 UID 下载全部插画
@@ -12,10 +14,14 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 - 下载收藏插画（公开/私密）
 - 增量更新已下载的画师作品
 - 多线程并发下载（默认 5 线程，最大 32）
-- 下载进度实时显示（彩色线程级输出）
+- 聚合下载进度显示（降低高并发下的终端刷新开销）
 - 自动重试与限流处理
 - 断点续传（跳过已下载文件）
 - HTTP/HTTPS CONNECT 代理（手动 TLS 隧道）
+- 流式下载写盘，避免整张图片先完整进入内存
+- 分页抓取 + 固定 worker 池流水线下载
+- 代理下载隧道复用，减少重复 CONNECT + TLS 握手
+- 热点接口轻量 JSON 定向解析
 - 日志系统（`--debug` 启用详细输出）
 - OAuth PKCE 登录（模拟 Pixiv Android 客户端）
 - Windows `pixiv://` 协议自动回调
@@ -27,8 +33,8 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 |------|-----------------|-----------|
 | 运行时依赖 | Node.js >= 16 | 无（单二进制） |
 | 安装方式 | npm install -g | 下载对应平台的二进制文件 |
-| 代理支持 | HTTP / SOCKS5 | HTTP CONNECT（手动 TLS 隧道） |
-| 直连模式 | 支持（已移除） | 不支持 |
+| 代理支持 | HTTP / SOCKS5 | 直连 + HTTP/HTTPS CONNECT |
+| 直连模式 | 支持 | 支持 |
 | Windows 协议回调 | 支持 | 支持 |
 | 配置存储 | 用户目录 | 用户目录 |
 | 交叉编译 | N/A | 支持 Windows/Linux/macOS |
@@ -48,9 +54,25 @@ zig build -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
 zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe
 zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe
+
+# 运行基准测试（推荐 ReleaseFast）
+zig build bench -Doptimize=ReleaseFast
 ```
 
 构建产物在 `zig-out/bin/` 目录下。
+
+例如：
+
+- Windows: `.\zig-out\bin\pxder.exe`
+- Linux/macOS: `./zig-out/bin/pxder`
+
+也可以直接通过：
+
+```bash
+zig build run -- --help
+```
+
+`zig build bench` 会运行一组本地 synthetic benchmark，主要覆盖本项目已经优化过的热点 JSON 解析与下载任务生成路径，方便在后续改动时做回归对比。
 
 ## 使用方法
 
@@ -113,8 +135,8 @@ pxder --setting
 [1] Download path       下载目录（必须设置）
 [2] Download thread     下载线程数（默认 5，范围 1-32）
 [3] Download timeout    下载超时秒数（默认 30）
-[4] Auto rename         自动重命名画师文件夹（跟随画师改名）
-[5] Proxy               代理设置
+[4] Proxy               代理设置
+[5] Auto rename         自动重命名画师文件夹（跟随画师改名）
 ```
 
 **代理格式：**
@@ -127,9 +149,11 @@ pxder --setting
 
 - `http://127.0.0.1:7890`
 - `http://user:pass@127.0.0.1:1080`
-- `socks5://127.0.0.1:1080`
+- `https://127.0.0.1:8443`
 
 输入空行则从环境变量 `all_proxy` / `https_proxy` / `http_proxy` 中读取。输入 `disable` 完全禁用代理。
+
+注意：当前下载链路实际支持并验证过的是 `http://` 和 `https://` CONNECT 代理；`socks4/4a/5/5h` 语法已预留解析，但尚未实现真实下载通路。
 
 ### 下载插画
 
@@ -161,7 +185,7 @@ pxder -p 70593670,70594912
 ```
 -M, --no-ugoira-meta    下载动图时不请求帧延迟元数据
 -O, --output-dir <dir>  覆盖下载目录
---force                 忽略关注列表缓存，强制重新获取
+--force                 预留兼容参数（当前版本暂未启用）
 --debug                 启用详细输出
 --no-protocol           登录时不使用 Windows 协议处理器
 --output-config-dir     输出配置文件目录路径
@@ -179,8 +203,16 @@ pxder -p 70593670,70594912
 - 已下载的插画会自动跳过
 - 单文件最多重试 10 次
 - 404 状态码直接跳过（Pixiv 自身问题）
-- 多线程同时出错时暂停 5 分钟后继续
+- 连续失败达到阈值时暂停 5 分钟后继续
 - 下载到临时目录后校验完整性再移至最终路径
+
+## 性能实现
+
+- 下载采用流式写盘，避免将整份原图先读入内存，降低高线程下的峰值内存和分配压力。
+- 下载任务采用生产者/消费者模型：分页拉取作品后立即入队，由固定 worker 池持续消费，而不是先全量收集再下载。
+- 代理下载路径会尽量复用同一图片服务器的 CONNECT + TLS 隧道，减少高频握手成本。
+- 热点 API（如 `user detail`、`following`、作品分页、`ugoira metadata`）优先使用轻量定向解析，减少 `std.json.Value` 动态树开销。
+- 终端进度输出改为限频聚合刷新，避免小文件高并发时被控制台 IO 拖慢吞吐。
 
 ## 项目结构
 
@@ -229,10 +261,10 @@ src/
 
 ## 技术细节
 
-- **HTTP/TLS**：基于 `std.http.Client` + `std.crypto.tls`，手动实现 HTTPS CONNECT 隧道以绕过 Zig 0.16 标准库的 TLS 升级缺陷
-- **并发模型**：每线程独立 HttpClient，避免共享状态竞争，通过原子索引实现工作窃取
+- **HTTP/TLS**：基于 `std.http.Client` + `std.crypto.tls`，为代理 HTTPS 路径手动实现 CONNECT 隧道与 TLS 升级，并复用下载隧道
+- **并发模型**：固定 worker 池 + 分页生产者流水线；每个 worker 维护独立 `HttpClient`，减少共享状态竞争
 - **加密**：`std.crypto.hash.Md5`（API 签名）、`std.crypto.hash.sha2.Sha256`（PKCE）、base64url
-- **JSON**：`std.json` 动态树解析（`std.json.Value`），配合辅助函数安全提取字段
+- **JSON**：热点路径使用定向结构解析，其余场景保留 `std.json.Value` 动态树解析
 - **依赖**：仅使用 Zig 标准库，无第三方依赖
 
 ## 致谢

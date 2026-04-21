@@ -11,7 +11,7 @@ pub const AppContext = struct {
     io: std.Io,
     environ_map: *std.process.Environ.Map,
     cfg: config.AppConfig,
-    http: http_client.HttpClient,
+    http: *http_client.HttpClient,
     api: pixiv_api.PixivApi,
     config_dir: []const u8,
 
@@ -21,7 +21,8 @@ pub const AppContext = struct {
         const environ_map = init_arg.environ_map;
 
         var cfg = try config.AppConfig.load(allocator, io, environ_map);
-        errdefer cfg.deinit();
+        var cfg_cleanup = true;
+        errdefer if (cfg_cleanup) cfg.deinit();
 
         if (validate_config) {
             cfg.validate() catch |err| switch (err) {
@@ -46,45 +47,63 @@ pub const AppContext = struct {
         // Resolve proxy config
         const proxy_config = resolveProxy(&cfg, environ_map);
 
-        var http = try http_client.HttpClient.init(allocator, io, proxy_config);
-        errdefer http.deinit();
-
-        var api = pixiv_api.PixivApi.init(allocator, io, http);
-        errdefer api.deinit();
-
-        // Refresh access token
-        if (cfg.refresh_token) |rt| {
-            api.refreshAccessToken(rt) catch |err| {
-                terminal.logError(io, "刷新令牌失败: {}", .{err});
-                return err;
-            };
-
-            // Update config with potentially new refresh token
-            if (api.refresh_token) |new_rt| {
-                if (cfg.refresh_token) |old_rt| allocator.free(old_rt);
-                cfg.refresh_token = try allocator.dupe(u8, new_rt);
-                cfg.save(io, environ_map) catch |err| {
-                    terminal.logError(io, "保存配置失败: {}", .{err});
-                };
-            }
-        }
+        const http = try allocator.create(http_client.HttpClient);
+        http.* = try http_client.HttpClient.init(allocator, io, proxy_config);
+        var http_cleanup = true;
+        errdefer if (http_cleanup) {
+            http.deinit();
+            allocator.destroy(http);
+        };
 
         const config_dir = try config.AppConfig.configDir(allocator, environ_map);
+        var config_dir_cleanup = true;
+        errdefer if (config_dir_cleanup) allocator.free(config_dir);
 
-        return .{
+        var ctx = AppContext{
             .allocator = allocator,
             .io = io,
             .environ_map = environ_map,
             .cfg = cfg,
             .http = http,
-            .api = api,
+            .api = undefined,
             .config_dir = config_dir,
         };
+        ctx.api = pixiv_api.PixivApi.init(allocator, io, ctx.http);
+        errdefer {
+            ctx.api.deinit();
+            ctx.http.deinit();
+            allocator.destroy(ctx.http);
+            ctx.cfg.deinit();
+            allocator.free(ctx.config_dir);
+        }
+        cfg_cleanup = false;
+        http_cleanup = false;
+        config_dir_cleanup = false;
+
+        // Refresh access token
+        if (ctx.cfg.refresh_token) |rt| {
+            ctx.api.refreshAccessToken(rt) catch |err| {
+                terminal.logError(io, "刷新令牌失败: {}", .{err});
+                return err;
+            };
+
+            // Update config with potentially new refresh token
+            if (ctx.api.refresh_token) |new_rt| {
+                if (ctx.cfg.refresh_token) |old_rt| allocator.free(old_rt);
+                ctx.cfg.refresh_token = try allocator.dupe(u8, new_rt);
+                ctx.cfg.save(io, environ_map) catch |err| {
+                    terminal.logError(io, "保存配置失败: {}", .{err});
+                };
+            }
+        }
+
+        return ctx;
     }
 
     pub fn deinit(self: *AppContext) void {
         self.api.deinit();
         self.http.deinit();
+        self.allocator.destroy(self.http);
         self.cfg.deinit();
         self.allocator.free(self.config_dir);
     }

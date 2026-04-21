@@ -16,8 +16,8 @@
 //!   - 其他错误: 最多重试 2 次，间隔 1 秒
 
 const std = @import("std");
+const illust_mod = @import("core/illust.zig");
 const http_client = @import("infra/http/http_client.zig");
-const json_utils = @import("shared/json_utils.zig");
 const terminal = @import("shared/terminal.zig");
 const crypto = @import("shared/crypto.zig");
 
@@ -65,6 +65,47 @@ fn formEncode(allocator: std.mem.Allocator, pairs: []const struct { []const u8, 
 }
 const DEFAULT_RETRY: u32 = 2;
 
+const TokenResponse = struct {
+    access_token: []const u8,
+    refresh_token: []const u8,
+};
+
+/// 只保留下载器热路径真正需要的字段，避免构建整棵动态 JSON 树。
+pub const UserDetailLite = struct {
+    user: struct {
+        name: []const u8,
+    },
+};
+
+pub const FollowingPreviewLite = struct {
+    user: struct {
+        id: u64,
+        name: []const u8,
+    },
+};
+
+pub const UserFollowingLite = struct {
+    next_url: ?[]const u8 = null,
+    user_previews: []FollowingPreviewLite,
+};
+
+pub const UserIllustsLite = struct {
+    next_url: ?[]const u8 = null,
+    illusts: []illust_mod.IllustEntryLite,
+};
+
+pub const IllustDetailLite = struct {
+    illust: illust_mod.IllustEntryLite,
+};
+
+pub const UgoiraMetadataLite = struct {
+    ugoira_metadata: struct {
+        frames: []struct {
+            delay: u32,
+        } = &.{},
+    },
+};
+
 /// 将当前时间格式化为 ISO 8601 字符串 (YYYY-MM-DDTHH:MM:SS+00:00)
 fn formatIso8601(io: std.Io, buf: []u8) ![]u8 {
     const ts = std.Io.Clock.now(.real, io);
@@ -101,11 +142,11 @@ fn md5Hex(data: []const u8, buf: *[33]u8) []const u8 {
 pub const PixivApi = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    http: http_client.HttpClient,
+    http: *http_client.HttpClient,
     access_token: ?[]const u8 = null,
     refresh_token: ?[]const u8 = null,
 
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, http: http_client.HttpClient) PixivApi {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, http: *http_client.HttpClient) PixivApi {
         return .{
             .allocator = allocator,
             .io = io,
@@ -205,6 +246,12 @@ pub const PixivApi = struct {
             return error.ServerError;
         }
 
+        // 先在原始响应体上检查 rate limit，避免先构造 JSON 树又立刻释放。
+        if (std.mem.indexOf(u8, resp.body, "rate limit") != null) {
+            std.Io.sleep(self.io, .fromSeconds(600), .real) catch {};
+            return self.callApi(path, retry);
+        }
+
         // 解析 JSON
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch {
             if (retry > 0) {
@@ -214,14 +261,61 @@ pub const PixivApi = struct {
             return error.InvalidResponse;
         };
 
-        // 检查 rate limit（在 parsed 的 body 中查找 "rate limit" 字样）
-        if (std.mem.indexOf(u8, resp.body, "rate limit") != null) {
-            parsed.deinit();
-            std.Io.sleep(self.io, .fromSeconds(600), .real) catch {};
-            return self.callApi(path, retry);
+        return parsed;
+    }
+
+    /// 发送 GET 请求并按指定结构体做定向 JSON 解析。
+    /// 热点接口只解析需要字段，可以显著减少分配和树状遍历成本。
+    pub fn callApiParsed(self: *PixivApi, comptime T: type, path: []const u8, retry: u32) !std.json.Parsed(T) {
+        const url = if (std.mem.startsWith(u8, path, "http://") or std.mem.startsWith(u8, path, "https://"))
+            path
+        else
+            try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ BASE_URL, path });
+        defer {
+            if (!std.mem.eql(u8, url, path)) self.allocator.free(@constCast(url));
         }
 
-        return parsed;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+
+        const header_result = try self.buildAuthHeaders(arena.allocator());
+
+        const resp = self.http.get(url, header_result.items) catch |err| {
+            if (err == error.ConnectionResetByPeer or err == error.ConnectionTimedOut) {
+                std.Io.sleep(self.io, .fromSeconds(3), .real) catch {};
+                return self.callApiParsed(T, path, retry);
+            }
+            if (retry > 0) {
+                std.Io.sleep(self.io, .fromSeconds(1), .real) catch {};
+                return self.callApiParsed(T, path, retry - 1);
+            }
+            return err;
+        };
+        defer resp.deinit();
+
+        if (@intFromEnum(resp.status) >= 500) {
+            if (retry > 0) {
+                std.Io.sleep(self.io, .fromSeconds(1), .real) catch {};
+                return self.callApiParsed(T, path, retry - 1);
+            }
+            return error.ServerError;
+        }
+
+        if (std.mem.indexOf(u8, resp.body, "rate limit") != null) {
+            std.Io.sleep(self.io, .fromSeconds(600), .real) catch {};
+            return self.callApiParsed(T, path, retry);
+        }
+
+        return std.json.parseFromSlice(T, self.allocator, resp.body, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch {
+            if (retry > 0) {
+                std.Io.sleep(self.io, .fromSeconds(1), .real) catch {};
+                return self.callApiParsed(T, path, retry - 1);
+            }
+            return error.InvalidResponse;
+        };
     }
 
     /// 使用 refresh_token 刷新 access_token
@@ -243,19 +337,13 @@ pub const PixivApi = struct {
 
         if (@intFromEnum(resp.status) != 200) return error.TokenRefreshFailed;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch
+        const parsed = std.json.parseFromSlice(TokenResponse, self.allocator, resp.body, .{
+            .ignore_unknown_fields = true,
+        }) catch
             return error.InvalidTokenResponse;
         defer parsed.deinit();
 
-        const response = parsed.value;
-        if (response != .object) return error.InvalidTokenResponse;
-
-        const new_access = json_utils.getFieldString(response, "access_token") orelse
-            return error.InvalidTokenResponse;
-        const new_refresh = json_utils.getFieldString(response, "refresh_token") orelse
-            return error.InvalidTokenResponse;
-
-        try self.setTokens(new_access, new_refresh);
+        try self.setTokens(parsed.value.access_token, parsed.value.refresh_token);
     }
 
     /// 通过 authorization code 交换 token（OAuth PKCE 流程的最后一步）
@@ -283,19 +371,13 @@ pub const PixivApi = struct {
 
         if (@intFromEnum(resp.status) != 200) return error.TokenExchangeFailed;
 
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp.body, .{}) catch
+        const parsed = std.json.parseFromSlice(TokenResponse, self.allocator, resp.body, .{
+            .ignore_unknown_fields = true,
+        }) catch
             return error.InvalidTokenResponse;
         defer parsed.deinit();
 
-        const response = parsed.value;
-        if (response != .object) return error.InvalidTokenResponse;
-
-        const new_access = json_utils.getFieldString(response, "access_token") orelse
-            return error.InvalidTokenResponse;
-        const new_refresh = json_utils.getFieldString(response, "refresh_token") orelse
-            return error.InvalidTokenResponse;
-
-        try self.setTokens(new_access, new_refresh);
+        try self.setTokens(parsed.value.access_token, parsed.value.refresh_token);
     }
 
     // ==================== API 端点 ====================
@@ -307,11 +389,25 @@ pub const PixivApi = struct {
         return self.callApi(path, DEFAULT_RETRY);
     }
 
+    /// 获取用户插画列表的轻量分页结构。
+    pub fn userIllustsLite(self: *PixivApi, user_id: u64) !std.json.Parsed(UserIllustsLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/user/illusts?user_id={d}", .{user_id});
+        defer self.allocator.free(path);
+        return self.callApiParsed(UserIllustsLite, path, DEFAULT_RETRY);
+    }
+
     /// 获取用户收藏插画
     pub fn userBookmarksIllust(self: *PixivApi, user_id: u64) !std.json.Parsed(std.json.Value) {
         const path = try std.fmt.allocPrint(self.allocator, "/v1/user/bookmarks/illust?user_id={d}&restrict=public", .{user_id});
         defer self.allocator.free(path);
         return self.callApi(path, DEFAULT_RETRY);
+    }
+
+    /// 获取用户收藏列表的轻量分页结构。
+    pub fn userBookmarksIllustLite(self: *PixivApi, user_id: u64) !std.json.Parsed(UserIllustsLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/user/bookmarks/illust?user_id={d}&restrict=public", .{user_id});
+        defer self.allocator.free(path);
+        return self.callApiParsed(UserIllustsLite, path, DEFAULT_RETRY);
     }
 
     /// 获取插画详情
@@ -321,6 +417,13 @@ pub const PixivApi = struct {
         return self.callApi(path, DEFAULT_RETRY);
     }
 
+    /// 获取插画详情的轻量版本，单 PID 下载时直接复用。
+    pub fn illustDetailLite(self: *PixivApi, illust_id: u64) !std.json.Parsed(IllustDetailLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/illust/detail?illust_id={d}", .{illust_id});
+        defer self.allocator.free(path);
+        return self.callApiParsed(IllustDetailLite, path, DEFAULT_RETRY);
+    }
+
     /// 获取 Ugoira 动图元数据
     pub fn ugoiraMetaData(self: *PixivApi, illust_id: u64) !std.json.Parsed(std.json.Value) {
         const path = try std.fmt.allocPrint(self.allocator, "/v1/ugoira/metadata?illust_id={d}", .{illust_id});
@@ -328,11 +431,25 @@ pub const PixivApi = struct {
         return self.callApi(path, DEFAULT_RETRY);
     }
 
+    /// 获取 ugoira 元数据的轻量版本，目前只解析帧延迟。
+    pub fn ugoiraMetaDataLite(self: *PixivApi, illust_id: u64) !std.json.Parsed(UgoiraMetadataLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/ugoira/metadata?illust_id={d}", .{illust_id});
+        defer self.allocator.free(path);
+        return self.callApiParsed(UgoiraMetadataLite, path, DEFAULT_RETRY);
+    }
+
     /// 获取用户详情
     pub fn userDetail(self: *PixivApi, user_id: u64) !std.json.Parsed(std.json.Value) {
         const path = try std.fmt.allocPrint(self.allocator, "/v1/user/detail?user_id={d}", .{user_id});
         defer self.allocator.free(path);
         return self.callApi(path, DEFAULT_RETRY);
+    }
+
+    /// 获取用户详情的轻量版本，只解析下载器真正用到的字段。
+    pub fn userDetailLite(self: *PixivApi, user_id: u64) !std.json.Parsed(UserDetailLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/user/detail?user_id={d}", .{user_id});
+        defer self.allocator.free(path);
+        return self.callApiParsed(UserDetailLite, path, DEFAULT_RETRY);
     }
 
     /// 获取关注用户的最新插画
@@ -347,9 +464,21 @@ pub const PixivApi = struct {
         return self.callApi(path, DEFAULT_RETRY);
     }
 
+    /// 获取关注列表的轻量分页结构，只保留 id、name 和 next_url。
+    pub fn userFollowingLite(self: *PixivApi, user_id: u64, restrict: []const u8) !std.json.Parsed(UserFollowingLite) {
+        const path = try std.fmt.allocPrint(self.allocator, "/v1/user/following?user_id={d}&restrict={s}", .{ user_id, restrict });
+        defer self.allocator.free(path);
+        return self.callApiParsed(UserFollowingLite, path, DEFAULT_RETRY);
+    }
+
     /// 获取下一页数据（通过 API 返回的 next_url）
     pub fn nextPage(self: *PixivApi, url: []const u8) !std.json.Parsed(std.json.Value) {
         return self.callApi(url, DEFAULT_RETRY);
+    }
+
+    /// 对 next_url 使用轻量结构解析，复用同一套重试和限流处理。
+    pub fn nextPageParsed(self: *PixivApi, comptime T: type, url: []const u8) !std.json.Parsed(T) {
+        return self.callApiParsed(T, url, DEFAULT_RETRY);
     }
 };
 
@@ -385,7 +514,7 @@ test "PixivApi setTokens copies strings" {
     var http = try http_client.HttpClient.init(std.testing.allocator, io_threaded.io(), null);
     defer http.deinit();
 
-    var api = PixivApi.init(std.testing.allocator, io_threaded.io(), http);
+    var api = PixivApi.init(std.testing.allocator, io_threaded.io(), &http);
     defer api.deinit();
 
     try api.setTokens("test_access_token", "test_refresh_token");

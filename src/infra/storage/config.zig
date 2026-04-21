@@ -16,6 +16,7 @@ pub const DownloadConfig = struct {
     timeout: u32 = 30, // 下载超时时间（秒）
     auto_rename: bool = false, // 当画师改名时自动重命名目录
     tmp: ?[]const u8 = null, // 临时文件目录，运行时设为 <configDir>/tmp
+    no_ugoira_meta: bool = false, // 运行时开关：跳过 ugoira 元数据请求，不写入配置文件
 };
 
 /// 应用全局配置

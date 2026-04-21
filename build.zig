@@ -26,6 +26,22 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
+    const bench_root_module = b.createModule(.{
+        .root_source_file = b.path("src/bench_main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const bench_exe = b.addExecutable(.{
+        .name = "pxder-bench",
+        .root_module = bench_root_module,
+    });
+
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run synthetic performance benchmarks");
+    bench_step.dependOn(&run_bench.step);
+
     const test_root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,

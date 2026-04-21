@@ -66,7 +66,7 @@ fn doLogin(init: std.process.Init) !void {
     // Create HTTP client and PixivApi for token exchange
     var http = try http_client.HttpClient.init(allocator, io, proxy_config);
     defer http.deinit();
-    var api = pixiv_api.PixivApi.init(allocator, io, http);
+    var api = pixiv_api.PixivApi.init(allocator, io, &http);
     defer api.deinit();
 
     // Exchange code for tokens
@@ -91,7 +91,7 @@ fn doLoginToken(init: std.process.Init, token: []const u8) !void {
     // Create HTTP client and PixivApi
     var http = try http_client.HttpClient.init(allocator, io, proxy_config);
     defer http.deinit();
-    var api = pixiv_api.PixivApi.init(allocator, io, http);
+    var api = pixiv_api.PixivApi.init(allocator, io, &http);
     defer api.deinit();
 
     // Refresh token to validate and get access token

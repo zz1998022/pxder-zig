@@ -17,18 +17,28 @@
 //!   }
 
 const std = @import("std");
-const json_utils = @import("../shared/json_utils.zig");
 const illust_mod = @import("illust.zig");
 const pixiv_api = @import("../pixiv_api.zig");
 
 /// 画师信息
 pub const IllustratorInfo = struct {
     id: u64,
-    name: []const u8,
+    name: ?[]const u8,
     allocator: std.mem.Allocator,
 
-    pub fn deinit(self: *const IllustratorInfo) void {
-        self.allocator.free(self.name);
+    pub fn deinit(self: *IllustratorInfo) void {
+        if (self.name) |name| {
+            self.allocator.free(name);
+            self.name = null;
+        }
+    }
+
+    /// 将名称所有权转移给调用方，避免中途再复制一次。
+    pub fn takeName(self: *IllustratorInfo) []const u8 {
+        std.debug.assert(self.name != null);
+        const name = self.name.?;
+        self.name = null;
+        return name;
     }
 };
 
@@ -57,8 +67,18 @@ pub const Illustrator = struct {
 
     /// 设置画师名称（从外部数据源如关注列表预填）
     pub fn setName(self: *Illustrator, name: []const u8) !void {
-        if (self.name) |n| self.allocator.free(n);
+        if (self.name) |n| {
+            // 关注列表等场景里，名称可能已经提前缓存过；相同名称就不再重复分配。
+            if (std.mem.eql(u8, n, name)) return;
+            self.allocator.free(n);
+        }
         self.name = try self.allocator.dupe(u8, name);
+    }
+
+    /// 直接接管一份已分配好的名称字符串，避免再次复制。
+    pub fn setOwnedName(self: *Illustrator, owned_name: []const u8) void {
+        if (self.name) |n| self.allocator.free(n);
+        self.name = owned_name;
     }
 
     /// 分页游标类型
@@ -79,51 +99,53 @@ pub const Illustrator = struct {
 
     /// 获取画师信息（如已缓存则直接返回）
     pub fn fetchInfo(self: *Illustrator, api: *pixiv_api.PixivApi) !IllustratorInfo {
-        if (self.name) |n| {
-            return .{ .id = self.id, .name = try self.allocator.dupe(u8, n), .allocator = self.allocator };
-        }
+        const name = try self.getOrFetchName(api);
+        return .{ .id = self.id, .name = try self.allocator.dupe(u8, name), .allocator = self.allocator };
+    }
 
-        const parsed = try api.userDetail(self.id);
+    /// 获取画师名称，首次请求时写入缓存，后续直接借用缓存切片。
+    /// 下载热路径优先使用这个接口，避免为了读名称再额外构造临时对象。
+    pub fn getOrFetchName(self: *Illustrator, api: *pixiv_api.PixivApi) ![]const u8 {
+        if (self.name) |n| return n;
+
+        const parsed = try api.userDetailLite(self.id);
         defer parsed.deinit();
-        const json = parsed.value;
-
-        if (json != .object) return error.InvalidUserDetail;
-        const user_val = json.object.get("user") orelse return error.InvalidUserDetail;
-        if (user_val != .object) return error.InvalidUserDetail;
-        const name_str = json_utils.getFieldString(user_val, "name") orelse return error.InvalidUserDetail;
-
-        self.name = try self.allocator.dupe(u8, name_str);
-        return .{ .id = self.id, .name = try self.allocator.dupe(u8, name_str), .allocator = self.allocator };
+        self.name = try self.allocator.dupe(u8, parsed.value.user.name);
+        return self.name.?;
     }
 
     /// 获取下一页插画（自动处理首次请求和分页）
-    pub fn illusts(self: *Illustrator, api: *pixiv_api.PixivApi) ![]illust_mod.Illust {
+    pub fn illusts(self: *Illustrator, api: *pixiv_api.PixivApi, no_ugoira_meta: bool) ![]illust_mod.Illust {
         const parsed = if (self.next_illust_url) |url|
-            try api.nextPage(url)
+            try api.nextPageParsed(pixiv_api.UserIllustsLite, url)
         else
-            try api.userIllusts(self.id);
+            try api.userIllustsLite(self.id);
         defer parsed.deinit();
 
-        return self.parseIllustResponse(parsed.value, .illust);
+        return self.parseIllustResponseLite(api, parsed.value, .illust, no_ugoira_meta);
     }
 
     /// 获取下一页收藏插画
-    pub fn bookmarks(self: *Illustrator, api: *pixiv_api.PixivApi) ![]illust_mod.Illust {
+    pub fn bookmarks(self: *Illustrator, api: *pixiv_api.PixivApi, no_ugoira_meta: bool) ![]illust_mod.Illust {
         const parsed = if (self.next_bookmark_url) |url|
-            try api.nextPage(url)
+            try api.nextPageParsed(pixiv_api.UserIllustsLite, url)
         else
-            try api.userBookmarksIllust(self.id);
+            try api.userBookmarksIllustLite(self.id);
         defer parsed.deinit();
 
-        return self.parseIllustResponse(parsed.value, .bookmark);
+        return self.parseIllustResponseLite(api, parsed.value, .bookmark, no_ugoira_meta);
     }
 
-    /// 从 API 响应中解析插画列表并更新分页游标
-    fn parseIllustResponse(self: *Illustrator, json: std.json.Value, which: PageType) ![]illust_mod.Illust {
-        if (json != .object) return error.InvalidApiResponse;
-
-        // 更新 next_url
-        if (json_utils.getFieldString(json, "next_url")) |next_url| {
+    /// 用轻量分页结构解析插画列表并更新分页游标。
+    /// 这里直接消费定向解析结果，避免旧实现里遍历动态 JSON 树。
+    fn parseIllustResponseLite(
+        self: *Illustrator,
+        api: *pixiv_api.PixivApi,
+        page: pixiv_api.UserIllustsLite,
+        which: PageType,
+        no_ugoira_meta: bool,
+    ) ![]illust_mod.Illust {
+        if (page.next_url) |next_url| {
             const url_copy = try self.allocator.dupe(u8, next_url);
             switch (which) {
                 .illust => {
@@ -162,16 +184,15 @@ pub const Illustrator = struct {
             }
         }
 
-        // 解析 illusts 数组
-        const illusts_array = json_utils.getFieldArray(json, "illusts") orelse return error.InvalidApiResponse;
         var result: std.ArrayListUnmanaged(illust_mod.Illust) = .empty;
         errdefer {
             for (result.items) |item| item.deinit(self.allocator);
             result.deinit(self.allocator);
         }
 
-        for (illusts_array.items) |item| {
-            const parsed = illust_mod.parseIllusts(self.allocator, item, null) catch continue;
+        for (page.illusts) |item| {
+            const ugoira_delay = self.resolveUgoiraDelay(api, item, no_ugoira_meta) catch null;
+            const parsed = illust_mod.parseIllustLite(self.allocator, item, ugoira_delay) catch continue;
             for (parsed) |il| {
                 try result.append(self.allocator, il);
             }
@@ -181,34 +202,50 @@ pub const Illustrator = struct {
         return result.toOwnedSlice(self.allocator);
     }
 
+    /// 只有在需要保留 ugoira 帧延迟命名时才额外请求元数据。
+    /// 这里取第一帧 delay，与原有单值文件名格式保持一致。
+    fn resolveUgoiraDelay(
+        self: *Illustrator,
+        api: *pixiv_api.PixivApi,
+        item: illust_mod.IllustEntryLite,
+        no_ugoira_meta: bool,
+    ) !?u32 {
+        _ = self;
+        if (no_ugoira_meta or !illust_mod.isUgoiraLite(item)) return null;
+
+        const parsed = try api.ugoiraMetaDataLite(item.id);
+        defer parsed.deinit();
+
+        if (parsed.value.ugoira_metadata.frames.len == 0) return null;
+        return parsed.value.ugoira_metadata.frames[0].delay;
+    }
+
     /// 获取下一页关注画师列表（公开）
     /// 返回 IllustratorInfo 数组（每个元素包含 id 和 name）
     pub fn following(self: *Illustrator, api: *pixiv_api.PixivApi) ![]IllustratorInfo {
         const parsed = if (self.next_following_url) |url|
-            try api.nextPage(url)
+            try api.nextPageParsed(pixiv_api.UserFollowingLite, url)
         else
-            try api.userFollowing(self.id, "public");
+            try api.userFollowingLite(self.id, "public");
         defer parsed.deinit();
 
-        return self.parseFollowingResponse(parsed.value);
+        return self.parseFollowingResponseLite(parsed.value);
     }
 
     /// 获取下一页私密关注画师列表
     pub fn followingPrivate(self: *Illustrator, api: *pixiv_api.PixivApi) ![]IllustratorInfo {
         const parsed = if (self.next_following_url) |url|
-            try api.nextPage(url)
+            try api.nextPageParsed(pixiv_api.UserFollowingLite, url)
         else
-            try api.userFollowing(self.id, "private");
+            try api.userFollowingLite(self.id, "private");
         defer parsed.deinit();
 
-        return self.parseFollowingResponse(parsed.value);
+        return self.parseFollowingResponseLite(parsed.value);
     }
 
-    fn parseFollowingResponse(self: *Illustrator, json: std.json.Value) ![]IllustratorInfo {
-        if (json != .object) return error.InvalidApiResponse;
-
-        // Update next_url
-        if (json_utils.getFieldString(json, "next_url")) |next_url| {
+    /// 关注列表只保留 id/name/next_url，避免旧实现里遍历整棵动态 JSON 树。
+    fn parseFollowingResponseLite(self: *Illustrator, page: pixiv_api.UserFollowingLite) ![]IllustratorInfo {
+        if (page.next_url) |next_url| {
             const url_copy = try self.allocator.dupe(u8, next_url);
             if (self.next_following_url) |u| self.allocator.free(u);
             self.next_following_url = url_copy;
@@ -219,24 +256,16 @@ pub const Illustrator = struct {
             }
         }
 
-        // Parse user_previews array
-        const user_previews = json_utils.getFieldArray(json, "user_previews") orelse return error.InvalidApiResponse;
         var result: std.ArrayListUnmanaged(IllustratorInfo) = .empty;
         errdefer {
-            for (result.items) |item| item.deinit();
+            for (result.items) |*item| item.deinit();
             result.deinit(self.allocator);
         }
 
-        for (user_previews.items) |item| {
-            if (item != .object) continue;
-            const user_val = item.object.get("user") orelse continue;
-            if (user_val != .object) continue;
-            const id = json_utils.getFieldInt(user_val, "id") orelse continue;
-            const name = json_utils.getFieldString(user_val, "name") orelse continue;
-
+        for (page.user_previews) |item| {
             try result.append(self.allocator, .{
-                .id = @intCast(id),
-                .name = try self.allocator.dupe(u8, name),
+                .id = item.user.id,
+                .name = try self.allocator.dupe(u8, item.user.name),
                 .allocator = self.allocator,
             });
         }
