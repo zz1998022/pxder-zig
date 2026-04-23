@@ -4,8 +4,6 @@ Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [
 
 单二进制分发，无运行时依赖，原生性能，支持交叉编译。
 
-当前版本基于 `Zig 0.16.0` 开发，核心下载链路已经完成一轮面向吞吐量的重构。
-
 ## 功能
 
 - 按画师 UID 下载全部插画
@@ -61,8 +59,6 @@ zig build bench -Doptimize=ReleaseFast
 
 构建产物在 `zig-out/bin/` 目录下。
 
-例如：
-
 - Windows: `.\zig-out\bin\pxder.exe`
 - Linux/macOS: `./zig-out/bin/pxder`
 
@@ -72,60 +68,27 @@ zig build bench -Doptimize=ReleaseFast
 zig build run -- --help
 ```
 
-`zig build bench` 会运行一组本地 synthetic benchmark，主要覆盖本项目已经优化过的热点 JSON 解析与下载任务生成路径，方便在后续改动时做回归对比。
+`zig build bench` 用于运行本地 benchmark。
 
-## 自动发版
+## 发版
 
-仓库内置了两条 GitHub Actions 工作流：
+仓库内置了几条 GitHub Actions 工作流：
 
-- [release.yml](.github/workflows/release.yml)：当推送 `v*` 标签时，自动校验版本号、下载 Zig 0.16.0、运行测试、构建 Windows x64 版本，并创建或更新 GitHub Release。
-- [winget.yml](.github/workflows/winget.yml)：当 GitHub Release 发布后，自动读取对应的 Windows `zip` 便携包资产，并调用 `wingetcreate update --submit` 向 `winget-pkgs` 提交更新 PR。
-- [winget-bootstrap.yml](.github/workflows/winget-bootstrap.yml)：用于首个版本尚未被 WinGet 收录时，一次性 fork `winget-pkgs`、写入初始 manifest 并创建首发 PR。
+- [release.yml](.github/workflows/release.yml)：推送 `v*` 标签后自动构建并发布 GitHub Release。
+- [winget.yml](.github/workflows/winget.yml)：Release 发布后自动提交 WinGet 更新。
+- [winget-bootstrap.yml](.github/workflows/winget-bootstrap.yml)：用于首个版本的 WinGet 提交。
 
-### Release 触发方式
-
-发布前先把 [src/cli/args.zig](src/cli/args.zig) 里的版本号改成目标版本，例如 `2.12.11`，然后执行：
+发布前先修改 [src/cli/args.zig](src/cli/args.zig) 中的版本号，然后执行：
 
 ```bash
-git tag v2.12.11
+git tag vX.Y.Z
 git push origin main --tags
 ```
 
-工作流会生成两个固定命名的资产：
+WinGet 相关变量：
 
-- `pxder-v2.12.11-windows-x64.zip`
-- `pxder-v2.12.11-windows-x64.exe`
-
-其中 `zip` 资产会作为 WinGet 的 portable 安装源使用，`.exe` 资产保留给直接下载用户。
-
-### 启用 WinGet 自动更新
-
-在 GitHub 仓库里配置以下项目：
-
-- Repository variable: `WINGET_PACKAGE_IDENTIFIER`
-  例如：`zz1998022.pxder`
-- Repository secret: `WINGET_CREATE_GITHUB_TOKEN`
-  这是一个 GitHub Personal Access Token（classic），至少需要 `public_repo` 权限，用于向 `microsoft/winget-pkgs` 自动提交 PR。
-
-### 首次接入说明
-
-常规更新流程使用 `wingetcreate update --submit`，适合 **已经被 winget 收录过** 的包。
-
-如果 `pxder` 还没有首次进入 `winget-pkgs`，先手动在 GitHub Actions 里运行一次 [winget-bootstrap.yml](.github/workflows/winget-bootstrap.yml)：
-
-1. 打开 `Actions`
-2. 选择 `Bootstrap WinGet Package`
-3. 点击 `Run workflow`
-4. 输入目标 Release 标签，例如 `v0.1.0`
-
-这个 bootstrap 工作流会自动：
-
-- 查询对应 Release 的 `zip` 资产与 SHA256
-- 如有需要自动 fork `microsoft/winget-pkgs`
-- 生成 `zz1998022.pxder` 的首发 manifest
-- 推送分支并创建首发 PR
-
-等首个 PR 被合并后，后续版本就可以完全交给 `winget.yml` 自动更新。
+- `WINGET_PACKAGE_IDENTIFIER`
+- `WINGET_CREATE_GITHUB_TOKEN`
 
 ## 使用方法
 
@@ -258,14 +221,6 @@ pxder -p 70593670,70594912
 - 404 状态码直接跳过（Pixiv 自身问题）
 - 连续失败达到阈值时暂停 5 分钟后继续
 - 下载到临时目录后校验完整性再移至最终路径
-
-## 性能实现
-
-- 下载采用流式写盘，避免将整份原图先读入内存，降低高线程下的峰值内存和分配压力。
-- 下载任务采用生产者/消费者模型：分页拉取作品后立即入队，由固定 worker 池持续消费，而不是先全量收集再下载。
-- 代理下载路径会尽量复用同一图片服务器的 CONNECT + TLS 隧道，减少高频握手成本。
-- 热点 API（如 `user detail`、`following`、作品分页、`ugoira metadata`）优先使用轻量定向解析，减少 `std.json.Value` 动态树开销。
-- 终端进度输出改为限频聚合刷新，避免小文件高并发时被控制台 IO 拖慢吞吐。
 
 ## 项目结构
 
