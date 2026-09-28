@@ -1,5 +1,7 @@
 # pxder-zig
 
+> `codex/rust-tui` 分支正在迁移到 Rust + TUI，保留 CLI。运行方式、兼容规则和测试见 [rust/README.md](rust/README.md)。下文仍描述原 Zig 实现。
+
 Pixiv 插画批量下载器，由 [Lemon](https://github.com/zz1998022) 基于 [pxder](https://github.com/Tsuk1ko/pxder)（原作者：[Tsuk1ko](https://github.com/Tsuk1ko)）使用 [Zig](https://ziglang.org/) 重写。
 
 单二进制分发，无运行时依赖，原生性能，支持交叉编译。

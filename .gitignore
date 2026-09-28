@@ -30,3 +30,6 @@ benchmark*.sh
 
 # Claude Code session
 .claude/
+
+# Rust build artifacts
+rust/target/

@@ -1,0 +1,78 @@
+name: Rust Release
+
+on:
+  push:
+    tags: ["rust-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - name: Validate tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: python
+        run: |
+          import os, tomllib
+          with open('rust/Cargo.toml', 'rb') as f:
+              version = tomllib.load(f)['package']['version']
+          assert os.environ['GITHUB_REF_NAME'] == f'rust-v{version}'
+      - run: cargo test --locked --manifest-path rust/Cargo.toml --all-targets
+      - run: cargo build --locked --release --target ${{ matrix.target }} --manifest-path rust/Cargo.toml
+      - name: Package
+        shell: python
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          import hashlib, os, pathlib, zipfile
+          target = os.environ['TARGET']
+          exe = 'pxder.exe' if target.endswith('msvc') else 'pxder'
+          output = pathlib.Path('dist'); output.mkdir()
+          archive = output / f'pxder-{target}.zip'
+          with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
+              z.write(pathlib.Path('rust/target') / target / 'release' / exe, exe)
+              z.write('rust/README.md', 'README.md')
+              z.write('LICENSE', 'LICENSE')
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          archive.with_suffix('.zip.sha256').write_text(f'{digest}  {archive.name}\n')
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pxder-${{ matrix.target }}
+          path: dist/*
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --draft --title "pxder $TAG" --generate-notes
