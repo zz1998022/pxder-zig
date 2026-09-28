@@ -1,4 +1,7 @@
-use super::{Confirmation, SOURCES, Screen, State};
+use super::{
+    Confirmation, KeyCode, SOURCES, Screen, State,
+    mouse::{HitMap, Target},
+};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Layout, Rect},
@@ -34,8 +37,47 @@ fn key(value: &str, label: &str) -> Vec<Span<'static>> {
             format!(" {value} "),
             Style::default().fg(ACCENT).bg(SURFACE).bold(),
         ),
-        Span::styled(format!(" {label}  "), Style::default().fg(MUTED)),
+        Span::styled(format!(" {label} "), Style::default().fg(MUTED)),
     ]
+}
+// Register only fully visible buttons; widths are terminal cells, including CJK.
+fn buttons(
+    hits: &mut HitMap,
+    area: Rect,
+    alignment: Alignment,
+    items: &[(&str, &str, KeyCode)],
+) -> Line<'static> {
+    let widths: Vec<_> = items
+        .iter()
+        .map(|(key_name, label, _)| Line::from(key(key_name, label)).width() as u16)
+        .collect();
+    let total: u16 = widths.iter().sum();
+    let mut x = area.x
+        + if alignment == Alignment::Center {
+            area.width.saturating_sub(total) / 2
+        } else {
+            0
+        };
+    for ((_, _, code), width) in items.iter().zip(widths) {
+        if area.height > 0 && x + width <= area.right() {
+            hits.add(Rect::new(x, area.y, width, 1), Target::Key(*code));
+        }
+        x += width;
+    }
+    Line::from(
+        items
+            .iter()
+            .flat_map(|(key_name, label, _)| key(key_name, label))
+            .collect::<Vec<_>>(),
+    )
+}
+fn line_area(area: Rect, row: u16) -> Rect {
+    Rect::new(
+        area.x,
+        area.y + row,
+        area.width,
+        u16::from(row < area.height),
+    )
 }
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(area.width.saturating_sub(4));
@@ -75,7 +117,8 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-pub(super) fn draw(frame: &mut Frame, state: &State) {
+pub(super) fn draw(frame: &mut Frame, state: &State) -> HitMap {
+    let mut hits = HitMap::default();
     let area = frame.area();
     frame.render_widget(
         Block::default().style(Style::default().bg(BG).fg(TEXT)),
@@ -93,7 +136,7 @@ pub(super) fn draw(frame: &mut Frame, state: &State) {
                 .block(panel(" PXDER ")),
             area,
         );
-        return;
+        return hits;
     }
     let rows = Layout::vertical([
         Constraint::Length(3),
@@ -139,12 +182,13 @@ pub(super) fn draw(frame: &mut Frame, state: &State) {
         let columns = Layout::horizontal([Constraint::Length(23), Constraint::Min(1)])
             .spacing(2)
             .split(rows[1]);
-        sidebar(frame, state, columns[0]);
+        sidebar(frame, state, columns[0], &mut hits);
         columns[1]
     } else {
         rows[1]
     };
-    dashboard(frame, state, content);
+    dashboard(frame, state, content, &mut hits);
+    hits.add(header[1], Target::Key(KeyCode::Char('l')));
     let hint = if state.busy {
         "下载进行中 · c 取消任务，g 查看日志"
     } else if state.config.refresh_token.is_none() {
@@ -159,24 +203,38 @@ pub(super) fn draw(frame: &mut Frame, state: &State) {
     } else {
         &state.message
     };
+    let mut items = vec![
+        ("n", "新任务", KeyCode::Char('n')),
+        ("s", "设置", KeyCode::Char('s')),
+        ("l", "账户", KeyCode::Char('l')),
+        ("g", "日志", KeyCode::Char('g')),
+        ("?", "帮助", KeyCode::Char('?')),
+        ("q", "退出", KeyCode::Char('q')),
+    ];
+    if state.busy {
+        items.push(("c", "取消", KeyCode::Char('c')));
+    }
+    let footer = buttons(&mut hits, line_area(rows[2], 1), Alignment::Left, &items);
     frame.render_widget(
         Paragraph::new(vec![
             text(feedback, if state.message_error { RED } else { MUTED }),
-            Line::from(
-                [
-                    key("n", "新任务"),
-                    key("s", "设置"),
-                    key("l", "账户"),
-                    key("g", "日志"),
-                    key("?", "帮助"),
-                    key("q", "退出"),
-                ]
-                .concat(),
-            ),
+            footer,
         ]),
         rows[2],
     );
+    if state.busy {
+        // Always visible, even when a narrow footer cannot fit all actions.
+        let cancel = Rect::new(header[1].right().saturating_sub(12), header[1].y + 2, 12, 1);
+        let line = buttons(
+            &mut hits,
+            cancel,
+            Alignment::Left,
+            &[("c", "取消", KeyCode::Char('c'))],
+        );
+        frame.render_widget(Paragraph::new(line), cancel);
+    }
     if state.screen != Screen::Dashboard || state.confirm.is_some() {
+        hits.0.clear();
         // A clean backdrop avoids clipped table borders and half-width glyphs
         // peeking around focused forms on compact terminals.
         frame.render_widget(
@@ -185,14 +243,25 @@ pub(super) fn draw(frame: &mut Frame, state: &State) {
         );
     }
     if state.screen != Screen::Dashboard && state.confirm.is_none() {
-        modal(frame, state, area);
+        modal(frame, state, area, &mut hits);
     }
     if let Some(confirm) = state.confirm {
-        confirmation(frame, confirm, area);
+        confirmation(frame, confirm, area, &mut hits);
     }
+    hits
 }
 
-fn sidebar(frame: &mut Frame, state: &State, area: Rect) {
+fn sidebar(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
+    let inner = panel("").inner(area);
+    for (row, code) in [
+        (2, KeyCode::Esc),
+        (3, KeyCode::Char('n')),
+        (4, KeyCode::Char('g')),
+        (7, KeyCode::Char('s')),
+        (8, KeyCode::Char('l')),
+    ] {
+        hits.add(line_area(inner, row), Target::Key(code));
+    }
     let account = if state.config.refresh_token.is_some() {
         "● 已连接"
     } else {
@@ -243,7 +312,7 @@ fn sidebar(frame: &mut Frame, state: &State, area: Rect) {
     );
 }
 
-fn dashboard(frame: &mut Frame, state: &State, area: Rect) {
+fn dashboard(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
     let rows = Layout::vertical([
         Constraint::Length(4),
         Constraint::Length(3),
@@ -317,7 +386,7 @@ fn dashboard(frame: &mut Frame, state: &State, area: Rect) {
         let split = Layout::vertical([Constraint::Min(5), Constraint::Length(6)])
             .spacing(1)
             .split(rows[2]);
-        recent_logs(frame, state, split[1]);
+        recent_logs(frame, state, split[1], hits);
         split[0]
     } else {
         rows[2]
@@ -326,10 +395,26 @@ fn dashboard(frame: &mut Frame, state: &State, area: Rect) {
         let block = panel(" 开始收藏 ");
         let inner = block.inner(body);
         frame.render_widget(block, body);
+        let start = Rect::new(
+            inner.x,
+            inner.y + inner.height.saturating_sub(4) / 2,
+            inner.width,
+            inner.height.min(4),
+        );
+        let welcome = buttons(
+            hits,
+            line_area(start, 2),
+            Alignment::Center,
+            &[
+                ("l", "连接账户", KeyCode::Char('l')),
+                ("s", "设置目录", KeyCode::Char('s')),
+                ("n", "新建下载", KeyCode::Char('n')),
+            ],
+        );
         let text_rows = vec![
             text("让喜欢的作品，留在本地。", TEXT).style(Style::default().fg(TEXT).bold()),
             text("", MUTED),
-            text("[l] 连接账户   →   [s] 设置目录   →   [n] 新建下载", ACCENT),
+            welcome,
             text("画师 · 作品 · 关注 · 收藏 · 增量更新", MUTED),
         ];
         frame.render_widget(
@@ -342,6 +427,7 @@ fn dashboard(frame: &mut Frame, state: &State, area: Rect) {
             ),
         );
     } else {
+        hits.add(body, Target::Scroll);
         let visible = body.height.saturating_sub(2) as usize;
         let offset = state
             .file_offset
@@ -377,7 +463,8 @@ fn dashboard(frame: &mut Frame, state: &State, area: Rect) {
         );
     }
 }
-fn recent_logs(frame: &mut Frame, state: &State, area: Rect) {
+fn recent_logs(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
+    hits.add(area, Target::Key(KeyCode::Char('g')));
     let logs: Vec<_> = state
         .snapshot
         .logs
@@ -410,7 +497,7 @@ fn log_line(value: &str) -> Line<'static> {
     )
 }
 
-fn modal(frame: &mut Frame, state: &State, area: Rect) {
+fn modal(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
     let (title, subtitle, height) = match state.screen {
         Screen::NewJob => ("新建下载", "选择来源，再添加需要下载的内容", 22),
         Screen::Settings => ("下载设置", "让每次下载按你的习惯运行", 24),
@@ -426,7 +513,7 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
             "↑ 查看较早记录 · ↓ 查看较新记录 · End 跟随最新",
             area.height.saturating_sub(2),
         ),
-        _ => ("快捷键", "键盘操作，无需离开终端", 21),
+        _ => ("快捷键", "鼠标点击或键盘操作，无需离开终端", 22),
     };
     let popup = centered(
         area,
@@ -453,9 +540,10 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
         parts[0],
     );
     match state.screen {
-        Screen::NewJob => job_form(frame, state, parts[1]),
-        Screen::Settings => settings_form(frame, state, parts[1]),
+        Screen::NewJob => job_form(frame, state, parts[1], hits),
+        Screen::Settings => settings_form(frame, state, parts[1], hits),
         Screen::Token => input(
+            hits,
             frame,
             state,
             parts[1],
@@ -482,6 +570,7 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
                 rows[0],
             );
             input(
+                hits,
                 frame,
                 state,
                 rows[1],
@@ -505,25 +594,38 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
                         if connected { GREEN } else { AMBER },
                     ),
                     Line::from(""),
-                    Line::from(key("o / Enter", "浏览器登录 · 推荐")),
+                    buttons(
+                        hits,
+                        line_area(parts[1], 2),
+                        Alignment::Left,
+                        &[("o / Enter", "浏览器登录 · 推荐", KeyCode::Char('o'))],
+                    ),
                     text("   使用 Pixiv 官方登录页完成授权", MUTED),
                     Line::from(""),
-                    Line::from(key("t", "使用已有 Token")),
+                    buttons(
+                        hits,
+                        line_area(parts[1], 5),
+                        Alignment::Left,
+                        &[("t", "使用已有 Token", KeyCode::Char('t'))],
+                    ),
                     text("   适合已有 refresh token 的设备迁移", MUTED),
                     Line::from(""),
-                    Line::from(key(
-                        "x",
-                        if connected {
-                            "登出当前账户"
-                        } else {
-                            "登录后可管理账户"
-                        },
-                    )),
+                    if connected {
+                        buttons(
+                            hits,
+                            line_area(parts[1], 8),
+                            Alignment::Left,
+                            &[("x", "登出当前账户", KeyCode::Char('x'))],
+                        )
+                    } else {
+                        text("登录后可管理账户", MUTED)
+                    },
                 ]),
                 parts[1],
             );
         }
         Screen::Logs => {
+            hits.add(parts[1], Target::Scroll);
             let count = parts[1].height as usize;
             let end = state.snapshot.logs.len().saturating_sub(state.log_offset);
             let start = end.saturating_sub(count);
@@ -550,6 +652,7 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
         _ => {
             frame.render_widget(
                 Paragraph::new(vec![
+                    text("点击按钮、输入框与开关；滚轮翻阅文件和日志", MUTED),
                     text("工作台", ACCENT),
                     text("n 新任务   s 设置   l 账户   g 日志", TEXT),
                     text("c 取消当前任务   q / Ctrl+C 退出", TEXT),
@@ -578,20 +681,25 @@ fn modal(frame: &mut Frame, state: &State, area: Rect) {
         &state.message,
         if state.message_error { RED } else { GREEN },
     )];
-    footer.push(Line::from(if submit.is_empty() {
-        key("Esc", "返回")
+    let items = if submit.is_empty() {
+        vec![("Esc", "返回", KeyCode::Esc)]
     } else {
-        [
-            key("Enter", submit),
-            key("Tab", "下一项"),
-            key("Esc", "返回"),
+        vec![
+            ("Enter", submit, KeyCode::Enter),
+            ("Tab", "下一项", KeyCode::Tab),
+            ("Esc", "返回", KeyCode::Esc),
         ]
-        .concat()
-    }));
+    };
+    footer.push(buttons(
+        hits,
+        line_area(parts[2], 1),
+        Alignment::Left,
+        &items,
+    ));
     frame.render_widget(Paragraph::new(footer), parts[2]);
 }
 
-fn job_form(frame: &mut Frame, state: &State, area: Rect) {
+fn job_form(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
     let rows = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(2),
@@ -601,6 +709,23 @@ fn job_form(frame: &mut Frame, state: &State, area: Rect) {
     ])
     .split(area);
     let focused = state.selected == 0;
+    if rows[0].height >= 3 {
+        let inner = panel("").inner(rows[0]);
+        hits.add(
+            Rect::new(inner.x, inner.y, 4.min(inner.width), 1),
+            Target::Source(KeyCode::Left),
+        );
+        let width = Line::from(SOURCES[state.source]).width() as u16 + 4;
+        hits.add(
+            Rect::new(
+                inner.x + 4,
+                inner.y,
+                width.min(inner.width.saturating_sub(4)),
+                1,
+            ),
+            Target::Source(KeyCode::Right),
+        );
+    }
     frame.render_widget(
         Paragraph::new(format!(
             " ←  {}  →   ({}/7)",
@@ -632,6 +757,7 @@ fn job_form(frame: &mut Frame, state: &State, area: Rect) {
     );
     if state.source < 2 {
         input(
+            hits,
             frame,
             state,
             rows[2],
@@ -653,6 +779,7 @@ fn job_form(frame: &mut Frame, state: &State, area: Rect) {
             rows[2],
         );
     }
+    hits.add(line_area(rows[3], 0), Target::Toggle(2));
     toggle(
         frame,
         rows[3],
@@ -667,7 +794,7 @@ fn job_form(frame: &mut Frame, state: &State, area: Rect) {
         rows[4],
     );
 }
-fn settings_form(frame: &mut Frame, state: &State, area: Rect) {
+fn settings_form(frame: &mut Frame, state: &State, area: Rect, hits: &mut HitMap) {
     // Compact enough for 60×20; each control keeps its label and value visible.
     let rows = Layout::vertical([
         Constraint::Length(3),
@@ -677,6 +804,7 @@ fn settings_form(frame: &mut Frame, state: &State, area: Rect) {
     ])
     .split(area);
     input(
+        hits,
         frame,
         state,
         rows[0],
@@ -689,9 +817,20 @@ fn settings_form(frame: &mut Frame, state: &State, area: Rect) {
     let pair = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
         .spacing(1)
         .split(rows[1]);
-    input(frame, state, pair[0], "并发数 · 1–32", 1, 1, "5", false);
-    input(frame, state, pair[1], "超时 · 秒", 2, 2, "30", false);
     input(
+        hits,
+        frame,
+        state,
+        pair[0],
+        "并发数 · 1–32",
+        1,
+        1,
+        "5",
+        false,
+    );
+    input(hits, frame, state, pair[1], "超时 · 秒", 2, 2, "30", false);
+    input(
+        hits,
         frame,
         state,
         rows[2],
@@ -701,6 +840,7 @@ fn settings_form(frame: &mut Frame, state: &State, area: Rect) {
         "留空使用系统；disable 禁用代理",
         true,
     );
+    hits.add(line_area(rows[3], 0), Target::Toggle(4));
     toggle(
         frame,
         rows[3],
@@ -739,7 +879,7 @@ fn toggle(frame: &mut Frame, area: Rect, label: &str, enabled: bool, focused: bo
 
 // Keep the insertion point visible without slicing through UTF-8 or counting
 // wide characters as a single terminal column. Secrets never enter the buffer.
-fn input_window(value: &str, cursor: usize, width: usize, secret: bool) -> (String, u16) {
+fn input_window(value: &str, cursor: usize, width: usize, secret: bool) -> (String, u16, usize) {
     let chars: Vec<char> = if secret {
         vec!['•'; value.chars().count()]
     } else {
@@ -766,10 +906,11 @@ fn input_window(value: &str, cursor: usize, width: usize, secret: bool) -> (Stri
         shown.push(*c);
         used += w;
     }
-    (shown, before as u16)
+    (shown, before as u16, start)
 }
 #[allow(clippy::too_many_arguments)]
 fn input(
+    hits: &mut HitMap,
     frame: &mut Frame,
     state: &State,
     area: Rect,
@@ -791,11 +932,44 @@ fn input(
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let cursor = if focused { state.cursor } else { 0 };
-    let (value, offset) = input_window(
+    let (value, offset, start) = input_window(
         &state.fields[index],
         cursor,
         inner.width.saturating_sub(1) as usize,
         secret,
+    );
+    hits.add(
+        area,
+        Target::Input {
+            focus,
+            cursor: state.fields[index].chars().count(),
+        },
+    );
+    let mut column = 0;
+    let mut position = start;
+    for ch in value.chars() {
+        let width = Line::from(ch.to_string()).width() as u16;
+        hits.add(
+            Rect::new(inner.x + column, inner.y, width, 1),
+            Target::Input {
+                focus,
+                cursor: position,
+            },
+        );
+        column += width;
+        position += 1;
+    }
+    hits.add(
+        Rect::new(
+            inner.x + column,
+            inner.y,
+            inner.width.saturating_sub(column),
+            1,
+        ),
+        Target::Input {
+            focus,
+            cursor: position,
+        },
     );
     let empty = state.fields[index].is_empty();
     frame.render_widget(
@@ -807,7 +981,7 @@ fn input(
         frame.set_cursor_position((inner.x + offset.min(inner.width.saturating_sub(1)), inner.y));
     }
 }
-fn confirmation(frame: &mut Frame, confirm: Confirmation, area: Rect) {
+fn confirmation(frame: &mut Frame, confirm: Confirmation, area: Rect, hits: &mut HitMap) {
     let popup = centered(area, 60, 10);
     frame.render_widget(Clear, popup);
     let (title, detail) = match confirm {
@@ -822,7 +996,15 @@ fn confirmation(frame: &mut Frame, confirm: Confirmation, area: Rect) {
             text("", MUTED),
             text(detail, TEXT),
             text("", MUTED),
-            Line::from([key("Enter", "确认"), key("Esc", "返回")].concat()),
+            buttons(
+                hits,
+                line_area(panel("").inner(popup), 5),
+                Alignment::Center,
+                &[
+                    ("Enter", "确认", KeyCode::Enter),
+                    ("Esc", "返回", KeyCode::Esc),
+                ],
+            ),
         ])
         .alignment(Alignment::Center)
         .block(panel(" 请确认 ").border_style(Style::default().fg(AMBER))),

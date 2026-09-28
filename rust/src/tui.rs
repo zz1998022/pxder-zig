@@ -7,6 +7,7 @@ use crate::{
 use anyhow::{Context, Result, bail};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
+mod mouse;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -383,6 +384,11 @@ struct Job {
 struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste
+        );
         ratatui::restore();
     }
 }
@@ -394,7 +400,11 @@ pub async fn run(store: ConfigStore, shutdown: CancellationToken) -> Result<()> 
     let mut state = State::new(store.load()?);
     let mut terminal = ratatui::try_init()?;
     let _restore = Restore;
-    crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableMouseCapture
+    )?;
     let mut events = EventStream::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut job: Option<Job> = None;
@@ -427,12 +437,16 @@ pub async fn run(store: ConfigStore, shutdown: CancellationToken) -> Result<()> 
                 state.message_error = state.snapshot.has_errors();
                 state.config = store.load()?;
             }
-            terminal.draw(|f| draw(f, &state))?;
+            let mut hits = mouse::HitMap::default();
+            terminal.draw(|f| {
+                hits = draw(f, &state);
+            })?;
             let action = tokio::select! {
                 _ = shutdown.cancelled() => Action::Quit,
                 _ = ticker.tick() => Action::None,
                 event = events.next() => match event {
                     Some(Ok(Event::Key(key))) => state.key(key),
+                    Some(Ok(Event::Mouse(event))) => state.mouse(event, &hits),
                     Some(Ok(Event::Paste(text))) => {
                         if state.confirm.is_none() { state.insert(&text); }
                         Action::None
@@ -605,7 +619,6 @@ pub async fn run(store: ConfigStore, shutdown: CancellationToken) -> Result<()> 
         job.cancel.cancel();
         let _ = job.handle.await;
     }
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     result
 }
 

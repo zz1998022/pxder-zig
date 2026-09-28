@@ -1,12 +1,189 @@
 use super::*;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{Terminal, backend::TestBackend, text::Line};
+
+fn mouse_at_text(
+    state: &mut State,
+    size: (u16, u16),
+    label: &str,
+    kind: MouseEventKind,
+) -> Result<Action> {
+    let mut terminal = Terminal::new(TestBackend::new(size.0, size.1))?;
+    let mut hits = mouse::HitMap::default();
+    terminal.draw(|f| {
+        hits = draw(f, state);
+    })?;
+    let text = render(state, size.0, size.1)?;
+    for (row, line) in text.lines().enumerate() {
+        for (byte, _) in line.match_indices(label) {
+            let column = Line::from(&line[..byte]).width() as u16;
+            if hits.at(column, row as u16).is_none() {
+                continue;
+            }
+            return Ok(state.mouse(
+                MouseEvent {
+                    kind,
+                    column,
+                    row: row as u16,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &hits,
+            ));
+        }
+    }
+    bail!("missing mouse target {label}:\n{text}")
+}
+fn click(state: &mut State, size: (u16, u16), label: &str) -> Result<Action> {
+    mouse_at_text(state, size, label, MouseEventKind::Down(MouseButton::Left))
+}
+
+#[test]
+fn mouse_forms_work_after_resize_and_distinguish_uid_pid() -> Result<()> {
+    let mut s = State::new(Config::default());
+    for size in [(120, 36), (80, 26), (60, 20)] {
+        s.open(Screen::Dashboard);
+        click(
+            &mut s,
+            size,
+            if size.0 >= 110 {
+                "下载设置"
+            } else {
+                "设置"
+            },
+        )?;
+        assert!(s.screen == Screen::Settings);
+        click(&mut s, size, "超时")?;
+        assert_eq!(s.selected, 2);
+        s.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        s.insert("45");
+        let old = s.fields[4].clone();
+        click(&mut s, size, "跟随画师名称")?;
+        assert_ne!(s.fields[4], old);
+        mouse_at_text(
+            &mut s,
+            size,
+            "跟随画师名称",
+            MouseEventKind::Up(MouseButton::Left),
+        )?;
+        assert_ne!(s.fields[4], old, "release must not toggle twice");
+        assert!(matches!(click(&mut s, size, "保存设置")?, Action::Submit));
+        assert_eq!(s.settings()?.download.timeout, 45);
+        click(&mut s, size, "返回")?;
+        click(&mut s, size, "新任务")?;
+        s.source = 0;
+        click(&mut s, size, "→")?;
+        assert_eq!(s.source, 1);
+        click(&mut s, size, "例如")?; // Focus the input, distinct from the source selector.
+        s.insert("123,456");
+        assert!(matches!(s.request()?.source, Source::Pids(ids) if ids == vec![123,456]));
+        click(&mut s, size, "跳过动图元数据")?;
+        assert!(s.request()?.no_ugoira_meta);
+        assert!(matches!(click(&mut s, size, "开始下载")?, Action::Submit));
+        click(&mut s, size, "←")?;
+        assert_eq!(s.source, 0);
+        assert!(matches!(s.request()?.source, Source::Uids(ids) if ids == vec![123,456]));
+    }
+    Ok(())
+}
+
+#[test]
+fn mouse_positions_unicode_and_scrolled_input_cursor() -> Result<()> {
+    let mut s = State::new(Config::default());
+    s.open(Screen::Settings);
+    s.insert("猫ab");
+    click(&mut s, (80, 26), "b")?;
+    s.insert("画");
+    assert_eq!(s.fields[0], "猫a画b");
+    s.fields[0] = format!("{}猫Z", "a".repeat(120));
+    s.cursor = s.fields[0].chars().count();
+    click(&mut s, (60, 20), "Z")?;
+    s.insert("画");
+    assert_eq!(s.fields[0], format!("{}猫画Z", "a".repeat(120)));
+    s.open(Screen::Token);
+    s.insert("secret");
+    click(&mut s, (80, 26), "•••")?;
+    s.insert("X");
+    assert_eq!(s.fields[0], "Xsecret");
+    assert!(!render(&s, 80, 26)?.contains("secret"));
+    Ok(())
+}
+
+#[test]
+fn mouse_modals_block_background_and_keep_busy_guards() -> Result<()> {
+    let mut s = State::new(Config::default());
+    s.busy = true;
+    click(&mut s, (60, 20), "设置")?;
+    assert!(s.screen == Screen::Dashboard && s.message.contains("运行"));
+    click(&mut s, (60, 20), "取消")?;
+    assert!(s.confirm.is_some());
+    let mut terminal = Terminal::new(TestBackend::new(60, 20))?;
+    let mut hits = mouse::HitMap::default();
+    terminal.draw(|f| {
+        hits = draw(f, &s);
+    })?;
+    assert_eq!(
+        hits.0.len(),
+        2,
+        "only the two confirmation buttons may be active"
+    );
+    assert!(matches!(
+        s.mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 17,
+                modifiers: KeyModifiers::NONE
+            },
+            &hits
+        ),
+        Action::None
+    ));
+    assert!(s.confirm.is_some());
+    click(&mut s, (60, 20), "返回")?;
+    assert!(s.confirm.is_none());
+    click(&mut s, (60, 20), "退出")?;
+    assert!(matches!(click(&mut s, (60, 20), "Enter")?, Action::Quit));
+    s.busy = false;
+    s.config.refresh_token = Some("fixture".into());
+    s.open(Screen::Login);
+    click(&mut s, (80, 26), "登出当前账户")?;
+    assert!(matches!(click(&mut s, (80, 26), "Enter")?, Action::Logout));
+    Ok(())
+}
+
+#[test]
+fn mouse_scroll_is_scoped_to_visible_lists() -> Result<()> {
+    let mut s = State::new(Config::default());
+    s.snapshot
+        .logs
+        .extend((0..50).map(|i| format!("record-{i}")));
+    s.open(Screen::Logs);
+    mouse_at_text(&mut s, (80, 26), "record-49", MouseEventKind::ScrollUp)?;
+    assert_eq!(s.log_offset, 1);
+    mouse_at_text(&mut s, (80, 26), "record-48", MouseEventKind::ScrollDown)?;
+    assert_eq!(s.log_offset, 0);
+    mouse_at_text(&mut s, (80, 26), "返回", MouseEventKind::ScrollUp)?;
+    assert_eq!(s.log_offset, 0);
+    s.open(Screen::Dashboard);
+    s.busy = true;
+    s.snapshot
+        .active
+        .extend((0..30).map(|i| (format!("file-{i:02}.png"), 0)));
+    mouse_at_text(&mut s, (80, 26), "file-00.png", MouseEventKind::ScrollDown)?;
+    assert_eq!(s.file_offset, 1);
+    mouse_at_text(&mut s, (80, 26), "file-01.png", MouseEventKind::ScrollUp)?;
+    assert_eq!(s.file_offset, 0);
+    Ok(())
+}
 
 fn press(state: &mut State, code: KeyCode) -> Action {
     state.key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 fn render(state: &State, width: u16, height: u16) -> Result<String> {
     let mut terminal = Terminal::new(TestBackend::new(width, height))?;
-    terminal.draw(|f| draw(f, state))?;
+    terminal.draw(|f| {
+        draw(f, state);
+    })?;
     let buffer = terminal.backend().buffer();
     let mut result = String::new();
     for y in 0..height {
